@@ -11,6 +11,7 @@ from .catalog import Catalog, _entities, _loads
 from .compiler import Compiler, SecurityContext
 from .model import Model, ModelError
 from .ops import Migration, apply_ops, conflicts
+from .obs import log_event
 from .query import Query
 
 
@@ -83,7 +84,9 @@ class Runner:
                 raise MigrationError(f"{m.id} was edited after it was applied (checksum changed); write a new migration instead", "checksum_mismatch")
             return {"id": m.id, "status": "already_applied", "version": prior["version"]}
         old = self.catalog.load()
-        new, touched = apply_ops(old, m.ops, self.catalog.dialect)
+        # Conflicts first: if a concurrent migration renamed or dropped what this one edits, the
+        # useful answer is "conflict, rebase", not the op error that would follow.
+        touched = set().union(*(op.touches(old) for op in m.ops))
         base = self._base(m)
         clashes = []
         for rec in self.catalog.applied_since(base):
@@ -93,6 +96,8 @@ class Runner:
         if clashes:
             detail = "; ".join(f"{c['migration']} also changed {', '.join(c['touches'])}" for c in clashes)
             raise MigrationError(f"{m.id} conflicts with migrations applied after version {base}: {detail}. Rebase it on version {self.catalog.head()}", "conflict")
+        new, touched_after = apply_ops(old, m.ops, self.catalog.dialect)
+        touched |= touched_after
         report = {
             "id": m.id,
             "status": "planned",
@@ -150,16 +155,18 @@ class Runner:
 
     def apply(self, m: Migration, actor: Optional[str] = None, *, require_approval: bool = False,
               allow_breaking: bool = True) -> dict[str, Any]:
-        prior = self.catalog.migration(m.id)
-        if require_approval and (not prior or prior["status"] != "approved"):
-            raise MigrationError(f"{m.id} needs human approval before it can be applied", "needs_approval")
-        report = self.plan(m)
-        if report["status"] == "already_applied":
-            return report
-        if not allow_breaking and report["impact"]["breaks"]:
-            names = ", ".join(b["query"] for b in report["impact"]["breaks"])
-            raise MigrationError(f"{m.id} would break saved queries: {names}", "would_break")
+        """Apply under the catalog lock. Everything is re-checked inside the lock (approval, checksum,
+        conflicts, impact), so concurrent appliers serialise and the loser sees the winner's version."""
         with self.catalog.transaction() as cat:
+            prior = cat.migration(m.id)
+            if prior and prior["status"] == "applied":
+                return self.plan(m, saved=False) | {"status": "already_applied"}
+            if require_approval and (not prior or prior["status"] != "approved"):
+                raise MigrationError(f"{m.id} needs human approval before it can be applied", "needs_approval")
+            report = self.plan(m)
+            if not allow_breaking and report["impact"]["breaks"]:
+                names = ", ".join(b["query"] for b in report["impact"]["breaks"])
+                raise MigrationError(f"{m.id} would break saved queries: {names}", "would_break")
             version, diff = cat.commit_version(m.id, report["_old"], report["_new"], actor)
             cat.upsert_migration(
                 id=m.id, description=m.description, checksum=m.checksum(),
@@ -169,6 +176,8 @@ class Runner:
                 impact=json.dumps(report.get("impact")), applied_at=_now(),
             )
             cat.audit("apply", actor, m.id, version, diff=diff)
+        log_event("migration.applied", migration_id=m.id, version=version, kind=m.kind(), actor=actor,
+                  rebased=report["rebased"], workspace_id=self.catalog.workspace_id)
         return self._public(report) | {"status": "applied", "version": version}
 
     def apply_all(self, files: list[Migration], actor: Optional[str] = None) -> list[dict[str, Any]]:
@@ -181,19 +190,21 @@ class Runner:
         return [self.apply(m, actor) for m in files if m.id not in done]
 
     def rollback(self, actor: Optional[str] = None, *, dry_run: bool = False) -> dict[str, Any]:
-        head = self.catalog.head()
-        if head == 0:
-            raise MigrationError("nothing to roll back")
-        rec = next(r for r in self.catalog.migrations("applied") if r["version"] == head)
-        old, new = self.catalog.load(head), self.catalog.load(self._previous(head))
-        report = {"id": rec["id"], "version": head, "to_version": self._previous(head),
-                  "diff": diff_models(old, new), "impact": self.impact(old, new)}
-        if dry_run:
-            return report | {"status": "dry_run"}
-        with self.catalog.transaction() as cat:
+        with self.catalog.transaction(lock=not dry_run) as cat:
+            head = cat.head()
+            if head == 0:
+                raise MigrationError("nothing to roll back")
+            rec = next(r for r in cat.migrations("applied") if r["version"] == head)
+            old, new = cat.load(head), cat.load(self._previous(head))
+            report = {"id": rec["id"], "version": head, "to_version": self._previous(head),
+                      "diff": diff_models(old, new), "impact": self.impact(old, new)}
+            if dry_run:
+                return report | {"status": "dry_run"}
             cat.pop_version(head)
             cat.upsert_migration(id=rec["id"], status="rolled_back")
             cat.audit("rollback", actor, rec["id"], head)
+        log_event("migration.rolled_back", migration_id=rec["id"], version=head, actor=actor,
+                  workspace_id=self.catalog.workspace_id)
         return report | {"status": "rolled_back"}
 
     def _previous(self, version: int) -> int:
@@ -205,10 +216,10 @@ class Runner:
     def propose(self, ops: list[dict[str, Any]], description: str, proposed_by: str,
                 migration_id: Optional[str] = None) -> dict[str, Any]:
         """Validate, dry-run and store a migration for a human to approve. Never applies it."""
-        mid = migration_id or self._next_id(description)
-        m = Migration.model_validate({"id": mid, "description": description, "base_version": self.catalog.head(), "ops": ops})
-        report = self._public(self.plan(m))
-        with self.catalog.transaction() as cat:
+        with self.catalog.transaction() as cat:  # the lock also makes id allocation race-free
+            mid = migration_id or self._next_id(description)
+            m = Migration.model_validate({"id": mid, "description": description, "base_version": cat.head(), "ops": ops})
+            report = self._public(self.plan(m))
             cat.upsert_migration(
                 id=m.id, description=description, checksum=m.checksum(),
                 ops=json.dumps([op.model_dump(mode="json", by_alias=True, exclude_defaults=True) for op in m.ops]),
@@ -216,20 +227,25 @@ class Runner:
                 base_version=m.base_version, proposed_by=proposed_by, impact=json.dumps(report["impact"]),
             )
             cat.audit("propose", proposed_by, m.id, kind=m.kind())
+        log_event("migration.proposed", migration_id=m.id, kind=m.kind(), actor=proposed_by,
+                  breaks=len(report["impact"]["breaks"]), workspace_id=self.catalog.workspace_id)
         return report | {"status": "proposed", "migration": m.model_dump(mode="json", by_alias=True, exclude_defaults=True)}
 
     def approve(self, mid: str, approver: str) -> None:
-        rec = self.catalog.migration(mid)
-        if not rec or rec["status"] != "proposed":
-            raise MigrationError(f"{mid} is not a pending proposal")
-        if approver == rec["proposed_by"]:
-            raise MigrationError("a proposal must be approved by someone other than its proposer", "forbidden")
         with self.catalog.transaction() as cat:
+            rec = cat.migration(mid)
+            if not rec or rec["status"] != "proposed":
+                raise MigrationError(f"{mid} is not a pending proposal", "not_found")
+            if approver == rec["proposed_by"]:
+                raise MigrationError("a proposal must be approved by someone other than its proposer", "forbidden")
             cat.upsert_migration(id=mid, status="approved", approved_by=approver)
             cat.audit("approve", approver, mid)
 
     def reject(self, mid: str, approver: str, reason: str = "") -> None:
         with self.catalog.transaction() as cat:
+            rec = cat.migration(mid)
+            if not rec or rec["status"] not in {"proposed", "approved"}:
+                raise MigrationError(f"{mid} is not a pending proposal", "not_found")
             cat.upsert_migration(id=mid, status="rejected", approved_by=approver)
             cat.audit("reject", approver, mid, reason=reason)
 
