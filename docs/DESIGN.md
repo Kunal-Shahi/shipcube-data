@@ -152,6 +152,7 @@ Every model table has `since_version INTEGER NOT NULL` and `until_version INTEGE
 | `saved_queries` | Queries that apps and dashboards depend on, with `app`, `tenant` and `roles`. These are the inputs to impact analysis. ShipCube registers them automatically when an app is deployed. |
 | `audit_log` | Every `propose`, `approve`, `reject`, `dry_run`, `apply` and `rollback`, with actor, migration, version and details (including the entity diff). |
 | `settings` | `dialect` of the warehouse the member SQL is written in, and the `workspace_id` that owns the catalog. |
+| `datasources` | Warehouse connections created in the console: `kind`, and the `secret_refs` reference (`secret_ref_id`, `secret_resource`, pinned `secret_version`). Non-secret `options` only. Credentials are resolved from Secret Manager at connect time. |
 | `data_role_assignments` | `(principal_type, principal, role)`. Principal types follow security's `access_grants`: `user` (email), `group`, `domain`, plus `workspace_role`. Gives data roles such as `finance` or `regional_manager`. |
 | `data_attributes` | `(principal_type, principal, key, value)`. These are the `$ctx` values for row policies, such as `region`, or a sub-tenant `tenant`. The most specific principal wins. |
 
@@ -333,7 +334,7 @@ sha256(
 
   The API reaches the catalog as `shipcube_app`, which has no `BYPASSRLS`. `apply` takes `pg_advisory_xact_lock(hashtext(workspace_id))`, so migrations in a workspace are serialized. SQLite's `BEGIN IMMEDIATE` plays this role in the prototype.
 - **Warehouse credentials.** The connection secret is referenced by name and stored in Secret Manager. The layer connects with a read-only role. L3 runs with a statement timeout and byte cap (BigQuery `maximum_bytes_billed`).
-- **Approval URLs.** `propose_migration` returns a console URL. Following ShipCube's rule for risky MCP actions, the human approves there, not through the agent's token (see [MCP.md](MCP.md)).
+- **Approval URLs.** `data_propose_migration` returns a console URL. Following ShipCube's rule for risky MCP actions, the human approves there, not through the agent's token (see [MCP.md](MCP.md)).
 - **Saved queries.** These are registered when an app is deployed: ShipCube's deploy step records the typed queries an app makes. Impact analysis is only as good as this registry.
 
 ---
@@ -349,7 +350,10 @@ sha256(
 | L1 operators: `share`, `rank`, `lag`, `running`, `compare` | Built |
 | L2 stages | Designed in [QUERY.md](QUERY.md), not built |
 | L3 validator | Built (DuckDB-focused deny-list) |
-| In-process MCP library (`tools.py`) and identity mapping from the security schema (`identity.py`) | Built |
+| In-process MCP library (`tools.py`, five `data_` tools plus console-only approve, apply and register_datasource) and identity mapping from the security schema (`identity.py`) | Built |
+| Migration drafting: Muse Spark hook, rule-based fallback, `MockMuse` (`drafting.py`) | Built (Muse mocked) |
+| Datasource registration from secret references (`datasources.py`) | Built (DuckDB connector; others supplied by the API) |
+| Installable package (`pip install git+…`, examples bundled in the wheel) | Built |
 | Dialects | DuckDB runs. Postgres, BigQuery and ClickHouse compile and parse back in tests, but no live warehouse was tested. |
 | Freshness tokens, pre-aggregations, BigQuery wildcard rendering | Designed, not built |
 | Postgres catalog with `workspace_id` | Designed, not built |

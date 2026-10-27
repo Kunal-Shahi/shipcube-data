@@ -97,6 +97,7 @@ class Runner:
             "id": m.id,
             "status": "planned",
             "kind": m.kind(),
+            "summary": summarize(m.ops, new),
             "base_version": base,
             "head_version": self.catalog.head(),
             "rebased": base != self.catalog.head(),
@@ -243,6 +244,41 @@ class Runner:
         nums = [int(r["id"].split("_")[0]) for r in self.catalog.migrations() if r["id"][:4].isdigit()]
         slug = re.sub(r"[^a-z0-9]+", "_", description.lower()).strip("_")[:40] or "change"
         return f"{max(nums, default=0) + 1:04d}_{slug}"
+
+
+def summarize(ops, model: Model) -> list[str]:
+    """One plain-English line per op, for the console's review screen."""
+    out = []
+    for op in ops:
+        d = op.model_dump(by_alias=True, exclude_none=True)
+        kind = op.classify()
+        name = d.get("name") or d.get("member") or d.get("cube") or d.get("target") or d.get("policy") or ""
+        if op.op == "add_measure":
+            cube, _, mname = name.partition(".")
+            m = model.cubes[cube].measures.get(mname) if cube in model.cubes else None
+            text = f"Add measure {name} = {m.agg}({m.sql or '*'})" + (f" where {m.filter}" if m and m.filter else "") if m else f"Add measure {name}"
+        elif op.op == "add_dimension":
+            cube, _, dname = name.partition(".")
+            dim = model.cubes[cube].dimensions.get(dname) if cube in model.cubes else None
+            text = f"Add {dim.type if dim else ''} dimension {name} = {d['sql']}".replace("  ", " ")
+        elif op.op == "create_cube":
+            text = f"Create cube {name} on {d.get('table') or 'a SQL query'}"
+        elif op.op == "rename_member":
+            text = f"Rename {name} to {d['to']} (old name keeps working as an alias)"
+        elif op.op == "change_sql":
+            text = f"Change the SQL of {name} to {d['sql']}"
+        elif op.op == "add_join":
+            text = f"Join {d['cube']} to {d['to']} ({d.get('relationship', 'many_to_one')}) on {d.get('on') or d.get('key')}"
+        elif op.op == "bind_schema":
+            text = f"Route cube {d.get('cube', '*')} for tenant {d.get('tenant', '*')} to schema {d['schema']}"
+        elif op.op == "grant_member":
+            text = f"Restrict {name} to roles {', '.join(d['roles'])}"
+        elif op.op == "add_row_policy":
+            text = f"Add row policy {name} for roles {', '.join(d.get('roles') or ['everyone'])}"
+        else:
+            text = f"{op.op.replace('_', ' ').capitalize()} {name}".strip()
+        out.append(f"[{kind}] {text}")
+    return out
 
 
 def _now() -> str:

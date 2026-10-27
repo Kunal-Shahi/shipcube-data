@@ -155,6 +155,19 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     created_at TEXT NOT NULL
 );
 
+-- Warehouse connections, created in the console. Credentials are referenced (security
+-- schema's secret_refs), never stored.
+CREATE TABLE IF NOT EXISTS datasources (
+    name            TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL,           -- duckdb | postgres | bigquery | clickhouse
+    secret_ref_id   TEXT,                    -- secret_refs.id
+    secret_resource TEXT,                    -- projects/<p>/secrets/<name>
+    secret_version  TEXT,                    -- pinned version
+    options         TEXT NOT NULL DEFAULT '{}',
+    created_by      TEXT,
+    created_at      TEXT NOT NULL
+);
+
 -- Who holds which data role. Principals follow the security schema's conventions
 -- (access_grants.principal_type): a user email, a Google group email, a domain, or a
 -- workspace membership role (owner/admin/developer/viewer). Not versioned: people come

@@ -24,7 +24,7 @@ A migration is a JSON document:
 }
 ```
 
-In a repo, it lives in a file named after its id, such as `migrations/0006_net_revenue.json`. Through MCP, the same object is the `propose_migration` argument.
+In a repo, it lives in a file named after its id, such as `migrations/0006_net_revenue.json`. Through MCP, the same object is the `data_propose_migration` argument.
 
 ### Why JSON ops
 
@@ -208,7 +208,7 @@ A planned improvement is warehouse introspection at apply time: read `INFORMATIO
 
 ## 4. Ordering and versions
 
-- **Ids** are `NNNN_slug`. The runner applies files in lexical id order. `propose_migration` assigns the next free number.
+- **Ids** are `NNNN_slug`. The runner applies files in lexical id order. `data_propose_migration` assigns the next free number.
 - **Versions.**
   - Each applied migration produces exactly one model version.
   - Versions are monotonic and **never reused**, even after a rollback, because cache keys and pinned queries refer to them.
@@ -238,7 +238,7 @@ The policy is **forward-only in shared workspaces, rollback in development**. Ro
 
 Each op declares what it **touches**: `cube:orders`, `member:orders.revenue`, `join:customers~orders`, `binding:*@acme`, `partition:orders`, `policy:orders.own_region`, `grant:order_items.freight` or `meta:orders`. The migration stores the union of its ops' touches. Two touch sets overlap when they share a key, or when one has `cube:X` and the other touches anything inside `X`.
 
-A migration also has a **base version**: the head it was written against. `propose_migration` sets it automatically. For a file without one:
+A migration also has a **base version**: the head it was written against. `data_propose_migration` sets it automatically. For a file without one:
 
 - If the file sorts after everything applied, the base is the current head.
 - If it sorts before an applied migration (out of order, for example from a parallel branch), the base is the version of the latest applied migration with a smaller id.
@@ -259,7 +259,7 @@ This is the same rule as a merge conflict, at member granularity.
 
 ## 8. Dry-run and impact analysis
 
-`dry_run(migration)` (CLI: `shipcube-data dry-run`; MCP: part of `propose_migration`):
+`dry_run(migration)` (CLI: `shipcube-data dry-run`; MCP: part of `data_propose_migration`):
 
 1. Validates the JSON (Pydantic) and every op against the current model.
 2. Checks conflicts (§7).
@@ -300,40 +300,35 @@ Here is a real report from the test fixtures:
 }
 ```
 
-`apply(..., allow_breaking=False)` refuses a migration whose impact has any `breaks`. The MCP `apply_migration` tool uses this by default.
+`apply(..., allow_breaking=False)` refuses a migration whose impact has any `breaks`. The console's Apply button uses this by default, and only an admin can override it.
 
 ## 9. Agents propose, humans approve
 
 ```
-agent                      data layer                         human (console)
-  │ describe_cube / list_cubes ──►                                │
-  │ propose_migration(ops, description) ──►                       │
-  │        validate → conflicts → diff → impact                   │
-  │        store status=proposed, base_version=head, audit        │
-  │ ◄── {id, kind, diff, impact, approval_url}                    │
-  │ (shows the user the impact, links approval_url) ─────────────►│
-  │                                                approve(id) ◄──┤ reviews the diff and impact
-  │                                           status=approved     │
-  │ apply_migration(id) ──►  require approved, re-plan (conflicts │
-  │                          and impact may have changed), apply  │
-  │ ◄── {version, fingerprint}                                    │
+agent (MCP)                     data layer                              person (console)
+  │ data_describe_cube ──►                                                   │
+  │ data_propose_migration(ops | request | code) ──►                         │
+  │        [draft: Muse Spark → validate; else rules]                        │
+  │        validate → conflicts → diff → impact → summary                    │
+  │        store status=proposed, base_version=head, audit                   │
+  │ ◄── {id, summary, diff, impact, approval_url}                            │
+  │ (shows the user the summary and impact, links approval_url) ────────────►│
+  │                                                       approve(id) ◄──────┤ reviews summary, diff, impact
+  │                                                   status=approved        │
+  │                                                         apply(id) ◄──────┤ re-plan (conflicts, impact
+  │                                                 new model version        │ may have changed), apply
 ```
+
+Agents have no apply tool at all. Approve and apply are console actions (`DataTools.approve` / `DataTools.apply`), which need a person's console session.
 
 These rules are enforced in `Runner`:
 
 - `propose` never applies anything.
 - `approve` requires `status = proposed` and an approver **different from the proposer**. ShipCube's API also requires the approver to be a human session (console ID token), not a PAT or an agent's OAuth token.
 - `apply(require_approval=True)` refuses anything that isn't `approved`.
+- Drafted proposals (Muse Spark or rules) go through exactly the same validation and dry-run as hand-written ops. `explained_by` records who drafted them.
 - Apply re-runs the plan, because other migrations may have landed since the proposal. A conflict at that point sends the proposal back for a rebase.
 - Every step is in `audit_log`: `propose → approve → apply`, each with its actor.
-
-**Optional auto-approval (workspace setting, off by default).** A proposal may be auto-approved when all of these hold:
-
-- its kind is `additive`;
-- `impact.breaks` and `impact.changes` are empty;
-- the workspace is a development workspace.
-
-Even then, it still goes through `approve`, with `approved_by = "policy:auto-additive"`.
 
 **What agents should do** (also in the MCP tool descriptions):
 
@@ -459,7 +454,7 @@ This example starts again from the demo model at v5, independent of 10.2.
 
 ### 10.4 An agent proposal
 
-The agent calls `propose_migration` with:
+The agent calls `data_propose_migration` with:
 
 ```json
 {"description": "Count distinct ordering customers",

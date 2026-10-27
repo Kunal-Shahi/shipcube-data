@@ -70,6 +70,13 @@ class DataLayer:
         self.cache = cache or ResultCache()
         self.runner = Runner(catalog)
 
+    @classmethod
+    def from_catalog(cls, catalog: Catalog, resolve_secret=None, connectors=None, datasource: str = "primary") -> "DataLayer":
+        """Build a DataLayer that queries the catalog's registered datasource (see datasources.py)."""
+        from .datasources import open_executor
+
+        return cls(catalog, open_executor(catalog, resolve_secret, datasource, connectors))
+
     @property
     def dialect(self) -> str:
         return self.catalog.dialect

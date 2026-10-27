@@ -1,40 +1,78 @@
 # MCP tools
 
-The data layer gives coding agents six tools. They ship as an **in-process Python library**, `shipcube_data.tools.DataTools`, which ShipCube's MCP server mounts directly. The library has no transport of its own.
+The data layer gives coding agents five tools. ShipCube's MCP server mounts them with a `data_` prefix, as Kunal decided on Oct 28 (shipcube `docs/WORKSTREAMS.md`, under "Decided").
+
+**Agents can never change the model.** They read, query and *propose*. A person approves and applies migrations, and connects warehouses, in the console. Those actions are library functions for the console and API, not MCP tools.
+
+## Install and import
+
+The package is `shipcube-data`. It needs Python 3.12, which is the language decision for the MCP server and API. Add it as a git dependency:
+
+```toml
+# services/mcp/pyproject.toml (or services/api)
+dependencies = [
+  "shipcube-data @ git+https://github.com/Kunal-Shahi/shipcube-data@main",
+  # pin a commit or tag once one is cut, e.g. ...@v0.1.0
+]
+```
+
+Add the `[duckdb]` extra only where the DuckDB demo warehouse is needed:
+
+```bash
+uv pip install "shipcube-data[duckdb] @ git+https://github.com/Kunal-Shahi/shipcube-data@main"
+```
+
+Everything the server and API need is exported from the top-level package:
 
 ```python
-from shipcube_data.tools import DataTools, ToolError
-from shipcube_data.identity import Caller
+from shipcube_data import (
+    DataTools, ToolError,          # the MCP tools + console actions
+    Caller,                        # identity built from the security schema
+    Catalog, DataLayer,            # catalog DB and query engine
+    MuseDrafter, MockMuse,         # migration drafting (Muse Spark, with rule fallback)
+    Datasource, SecretRef,         # warehouse connections
+)
 
-tools = DataTools(layer_for=lambda workspace_id: data_layer_for(workspace_id))
+def data_layer_for(workspace_id):            # one catalog per workspace (Postgres in production)
+    catalog = Catalog(catalog_dsn_for(workspace_id), workspace_id=str(workspace_id))
+    return DataLayer.from_catalog(catalog, resolve_secret=secret_manager_access, connectors=WAREHOUSE_CONNECTORS)
 
-for spec in tools.specs():            # name, description, inputSchema (JSON Schema), scope
-    server.register(spec, handler=lambda args, caller, n=spec["name"]: tools.call(n, args, caller))
+tools = DataTools(layer_for=data_layer_for, drafter=MuseDrafter(muse_spark_client))
+
+for spec in tools.specs():                   # data_list_cubes … data_propose_migration
+    server.register(spec["name"], spec["description"], spec["inputSchema"],
+                    handler=lambda args, caller, n=spec["name"]: tools.call(n, args, caller))
 
 # per request, after verifying the sc_pat_ / OAuth token:
 caller = Caller(workspace_id=ws.id, workspace_slug=ws.slug, via="mcp", email=user.email,
                 user_id=user.id, hosted_domain=user.hosted_domain, membership_role=m.role,
                 token_id=token.id, scopes=token.scopes)
 try:
-    result = tools.call("query", args, caller)   # plain JSON-able dict
+    result = tools.call("data_query", args, caller)   # plain JSON-able dict
 except ToolError as e:
-    return mcp_error(e.to_dict())                # {"code", "message", "hint"}
+    return mcp_error(e.to_dict())                     # {"code", "message", "hint"}
 ```
 
-`DataTools.approve(migration_id, caller)` is the console's approve action. It is not an MCP tool.
+`specs(prefix="")` gives unprefixed names if ever needed. `call()` accepts both forms.
 
-**Language decision.** Mounting in-process assumes the MCP server is Python, as language's PR #4 recommends. If the server stays in TypeScript (networking's PR #1), the same `DataTools.specs()`/`call()` pair sits behind a small internal HTTP endpoint, and nothing else changes. This waits on Kunal's language decision.
-
-| Tool | Scope | Calls |
+| MCP tool | Scope | Calls |
 |---|---|---|
-| `list_cubes` | `data:read` | `DataLayer.list_cubes` |
-| `describe_cube` | `data:read` | `DataLayer.describe_cube` |
-| `query` | `data:read` | `DataLayer.query` / `DataLayer.compile` |
-| `search_values` | `data:read` | `DataLayer.search_values` |
-| `propose_migration` | `data:write` | `Runner.propose` |
-| `apply_migration` | `data:write` | `Runner.apply(require_approval=True, allow_breaking=False)` |
+| `data_list_cubes` | `data:read` | `DataLayer.list_cubes` |
+| `data_describe_cube` | `data:read` | `DataLayer.describe_cube` |
+| `data_query` | `data:read` | `DataLayer.query` / `DataLayer.compile` |
+| `data_search_values` | `data:read` | `DataLayer.search_values` |
+| `data_propose_migration` | `data:write` | Drafter (optional), then `Runner.propose` |
 
-There is also an optional seventh tool, `raw_sql` (L3). It needs the `data:raw` scope and a workspace setting, and is off by default.
+These console and API actions need a person's console session (`Caller.via == "console"`, no token):
+
+| Function | Who | Does |
+|---|---|---|
+| `DataTools.approve(id, caller)` | admin, or developer for `additive` migrations; never the proposer's own principal | Marks a proposal approved |
+| `DataTools.apply(id, caller, allow_breaking=False)` | developer; `allow_breaking=True` needs admin | Re-plans (conflicts, impact), then applies an approved migration |
+| `DataTools.register_datasource(caller, name, kind, secret_ref, options)` | admin | Connects a warehouse from a stored secret reference |
+| `Runner.rollback(...)` | admin (console or CLI) | Pops the head model version |
+
+There is also an optional `raw_sql` (L3). It needs the `data:raw` scope and a workspace setting, is off by default, and is not in `specs()` yet.
 
 ## Identity: from the security schema to a security context
 
@@ -61,7 +99,7 @@ The library also checks, before anything runs:
 | The token has the tool's scope (`data:read` or `data:write`). Console and app requests are bounded by role and IAP instead. | `forbidden` |
 | The caller is a workspace member, or is reading through an app. | `forbidden` |
 | The catalog belongs to the caller's workspace. | `forbidden` |
-| `propose_migration` and `apply_migration` need `developer` or higher. | `forbidden` |
+| `data_propose_migration` needs `developer` or higher. | `forbidden` |
 | Approving needs a human console session, not a token. Developers may approve `additive` migrations; `change` and `breaking` migrations need `admin`. The approver must be a different principal from the proposer. The token's owner may approve their own agent's proposal from the console. | `forbidden` |
 
 Data roles and attributes are workspace access settings, not semantic-model changes, so they live outside migrations. The catalog's `assign_role`, `unassign_role` and `set_attribute` record every change in `audit_log`. The console's "Data access" page writes them.
@@ -84,7 +122,7 @@ An agent can only ever see what its human could see.
 
 ---
 
-## `list_cubes`
+## `data_list_cubes`
 
 Lists the cubes and members the caller can see.
 
@@ -105,7 +143,7 @@ Lists the cubes and members the caller can see.
 ]}
 ```
 
-## `describe_cube`
+## `data_describe_cube`
 
 Returns the full metadata for one cube: the LLM metadata contract.
 
@@ -143,7 +181,7 @@ The metadata contract has these rules:
 - Hidden members are absent, not marked hidden.
 - A cube with no visible members behaves as if it doesn't exist.
 
-## `query`
+## `data_query`
 
 Runs a typed L0/L1 query, or compiles it without running it.
 
@@ -179,9 +217,12 @@ Runs a typed L0/L1 query, or compiles it without running it.
 | `partition_filter_required` | `order_items is partitioned by shipping_limit_date; filter on it` | |
 | `invalid_arguments` | `query.limit: Input should be greater than or equal to 1` | `1 error(s) in total` |
 | `invalid` | Other query errors, such as mixing measures and dimensions in one filter group | |
+| `cannot_draft` | `could not draft a migration from that request` | A sentence the rules understand |
+| `unknown_tool` | `no tool named data_apply_migration` (agents cannot apply) | |
+| `no_datasource` | `no datasource 'primary'; connect a warehouse in the console` | |
 | `forbidden` | Missing scope, not a member, wrong workspace, missing `$ctx` value, no schema binding | |
 
-## `search_values`
+## `data_search_values`
 
 Finds distinct values of a dimension, for grounding filters ("which spelling of São Paulo is in the data?").
 
@@ -198,74 +239,76 @@ Finds distinct values of a dimension, for grounding filters ("which spelling of 
 
 This is an ordinary L0 query (`dimensions: [d]`, `contains` filter, `limit`), so RLS, grants and routing apply. A regional manager only sees cities in their region. Production should add a per-dimension `searchable: false` flag, settable with `set_meta`, for free-text or PII dimensions.
 
-## `propose_migration`
+## `data_propose_migration`
 
-Validates, dry-runs and stores a migration for a human to approve. **It never changes the model.**
+Validates, dry-runs and stores a migration for a human to approve. **It never changes the model.** The agent passes one of:
+
+- **explicit `ops`** (with a `description`), or
+- **a plain-English `request` and/or app `code`.** The layer drafts the ops. Muse Spark goes first, and deterministic rules are the fallback.
 
 **Input**
 
 ```json
 {
   "type": "object",
-  "required": ["description", "ops"],
   "properties": {
-    "description": {"type": "string", "description": "Why. Stored with the migration and shown to the approver."},
-    "ops": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Op"}}
+    "description": {"type": "string", "description": "Why. Required with explicit ops; otherwise taken from the draft."},
+    "ops": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Op"}},
+    "request": {"type": "string", "description": "e.g. 'add measure unique_customers as count distinct of customer_id on orders'"},
+    "code": {"type": "string", "description": "App code whose SQL should be lifted into governed members"}
   },
   "additionalProperties": false
 }
 ```
 
-`$defs/Op` is the JSON Schema of the discriminated union in `ops.py` (`OP_ADAPTER.json_schema()`). [MIGRATIONS.md](MIGRATIONS.md) documents the vocabulary.
+At least one of `ops`, `request` or `code` is required. `$defs/Op` is the JSON Schema of the discriminated union in `ops.py`. [MIGRATIONS.md](MIGRATIONS.md) documents the vocabulary.
 
-**Output:** the dry-run report (see [MIGRATIONS.md](MIGRATIONS.md), "Dry-run and impact analysis") plus three fields:
+**Output:** the dry-run report (see [MIGRATIONS.md](MIGRATIONS.md), "Dry-run and impact analysis"), which is everything the console's review screen needs:
 
 ```json
 {
   "id": "0006_count_distinct_ordering_customers", "status": "proposed", "kind": "additive",
+  "summary": ["[additive] Add measure orders.unique_customers = count_distinct(customer_id)"],
   "diff": {"added": ["members:orders.unique_customers"], "changed": [], "removed": []},
   "impact": {"breaks": [], "changes": [], "warnings": [], "unaffected": 3, "apps_broken": []},
   "migration": {"id": "…", "description": "…", "base_version": 5, "ops": […]},
   "approval_url": "https://console.shipcube.dev/w/<workspace>/data/migrations/0006_count_distinct_ordering_customers",
-  "auto_approved": false
+  "explained_by": "agent | muse-spark | rules",
+  "draft_notes": ["Muse Spark draft unusable (…); drafted with rules instead", "n: already modelled as orders.count; query that instead"],
+  "next_step": "A person reviews this in the console and approves it; agents cannot apply migrations."
 }
 ```
 
-**Errors:** `invalid_op` (`op 2 (change_sql): …`), `conflict` (from the conflict check), `invalid_arguments` and `forbidden` (needs `developer`).
+The `id` is what the console approves and applies. `summary` has one plain-English line per op, showing inferred values such as the aggregation, so a reviewer sees what will actually be stored.
 
-The proposer is recorded as `agent:<token id>` together with the token owner. ShipCube treats model changes as risky actions, so `approval_url` is a console page where a human reviews:
+**Errors:**
 
-- the ops;
-- the entity diff;
-- each broken or changed saved query, with links to the app.
+- `invalid_op` (`op 2 (change_sql): …`)
+- `conflict`
+- `cannot_draft` (the hint shows a sentence the rules understand)
+- `invalid_arguments`
+- `forbidden` (needs `developer`)
 
-## `apply_migration`
+The proposer is recorded as `token:<id>`, and the audit row carries `actor_token_id`.
 
-Applies a migration that a human has approved.
+### Drafting with Muse Spark
 
-**Input**
+`drafting.py` defines the hook:
 
-```json
-{"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}, "additionalProperties": false}
+```python
+MuseClient = Callable[[str, str], str]   # (system prompt, user prompt) -> reply text
+tools = DataTools(layer_for, drafter=MuseDrafter(muse_client))
 ```
 
-**Behaviour**
+ShipCube implements `muse_client` over its AI gateway. Here is how a draft is made:
 
-- The status must be `approved`. Otherwise the result is error `needs_approval`, with the `approval_url` in `hint`, and the model doesn't change.
-- Apply re-plans before writing. If another migration landed since the proposal, the result can be:
-  - `conflict` (re-propose against the new head);
-  - `would_break` (the impact now includes `breaks`; a human must re-approve with "allow breaking", which only the console offers).
-- On success:
-
-  ```json
-  {"id": "…", "status": "applied", "version": 6,
-   "fingerprint": {"before": "e7ea…", "after": "6946…"}, "diff": {…}}
-  ```
-
-**Notes**
-
-- Applying is idempotent: a second call returns `already_applied`.
-- Rollback is not an MCP tool. It is a console or CLI action for workspace admins.
+- **The prompt.** It lists the allowed ops and their required keys, plus a compact summary of the current model (cubes, members, joins). That keeps Muse reusing existing members instead of duplicating them. Muse must reply with one JSON object `{description, ops}`.
+- **Muse's reply is never trusted.** Each op is validated against the op schema here, then validated against the model, conflict-checked and dry-run by `Runner.propose`, the same as hand-written ops.
+- **The fallback.** If Muse isn't configured, times out, or returns no JSON or invalid ops, `RuleDrafter` drafts instead. `draft_notes` says why, and `explained_by` is `rules`.
+- **What `RuleDrafter` understands:**
+  - a small English grammar: `add measure <name> as <sum|count|count distinct|average|min|max> of <column> on <cube>`, `add dimension <name> on <cube> from <column>`, `rename <cube.member> to <name>`, `deprecate <cube.member> because …`;
+  - **lifting aggregates from SQL strings in app code.** `COUNT(DISTINCT customer_id) AS buyers FROM orders` becomes `add_measure orders.buyers`. Aggregates already in the model are reported as "already modelled as orders.count; query that instead".
+- **Testing.** `MockMuse(reply)` stands in for Muse in tests and demos, and records the prompts it was sent.
 
 ## `raw_sql` (optional, L3)
 
@@ -279,12 +322,27 @@ The tool description tells agents to use `query` first. `raw_sql` is for one-off
 
 ---
 
+## Connecting a warehouse (console)
+
+Credentials never pass through an agent or this library's storage:
+
+1. The console stores the credential in Secret Manager and creates a `secret_refs` row (security schema): `id`, `resource_name`, and a pinned `version`.
+2. The API calls `DataTools.register_datasource(caller, "primary", "postgres", secret_ref={"id": …, "resource_name": "projects/…/secrets/…", "version": "3"}, options={"host": …, "database": …})`. This validates three things:
+   - the kind is one of DuckDB, Postgres, BigQuery or ClickHouse;
+   - the version is a pinned number, not `latest`;
+   - no option name looks like a credential.
+
+   It also refuses to switch the dialect under an existing model. It stores only the reference, sets the catalog dialect, and writes `data.datasource.register` to the audit log.
+3. At query time, `DataLayer.from_catalog(catalog, resolve_secret, connectors)` calls `resolve_secret(SecretRef)` (the API's Secret Manager access) and a connector factory per kind. DuckDB is built in. The API supplies the Postgres, BigQuery and ClickHouse connectors, which run with read-only warehouse roles.
+
 ## Wiring checklist (for the ShipCube MCP server)
 
-- [ ] Register `DataTools.specs()` as tools. The input schemas are already JSON Schema, generated from the Pydantic models.
+- [ ] Add the git dependency. Register `DataTools.specs()` (prefixed `data_`) as tools. The input schemas are already JSON Schema.
+- [ ] Pass `MuseDrafter(muse_client)` once the AI gateway exposes Muse Spark. Until then the default `RuleDrafter` is used.
 - [ ] Build `Caller` from the verified token, membership and workspace (see the identity section above), never from tool arguments.
 - [ ] Return `ToolError.to_dict()` as the MCP error payload.
-- [ ] Add a console page at `/w/<ws>/data/migrations/<id>` whose approve button calls `DataTools.approve` with the console session's `Caller`.
+- [ ] Add a console page at `/w/<ws>/data/migrations/<id>`. It shows `summary`, `diff` and `impact`, and has **Approve** (`DataTools.approve`) and **Apply** (`DataTools.apply`) buttons, both using the console session's `Caller`.
+- [ ] Add a console "Connect warehouse" form that writes the secret to Secret Manager, then calls `DataTools.register_datasource`.
 - [ ] Add a console "Data access" page for data roles and attributes (`Catalog.assign_role` / `set_attribute`).
 - [ ] Register each deployed app's typed queries as `saved_queries` (name, app, tenant, roles), so impact analysis has something to check.
 - [ ] Settle the scope names `data:read`/`data:write` with the console's scope list.

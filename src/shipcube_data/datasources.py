@@ -1,0 +1,106 @@
+"""Warehouse connections.
+
+A datasource is created in the console by a person, never by an agent. The catalog stores
+only a *reference* to the credential (a row of the security schema's `secret_refs`: id,
+Secret Manager resource name, pinned version). The value is fetched at connect time by a
+resolver the API supplies, and never stored or logged here.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Callable, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .catalog import Catalog, _now
+from .compiler import DIALECTS
+from .model import ModelError
+
+_RESOURCE_RE = re.compile(r"^projects/[^/]+/secrets/[A-Za-z0-9_-]+$")
+_SECRETISH = re.compile(r"(password|passwd|secret|token|key|credential)", re.I)
+
+
+class SecretRef(BaseModel):
+    """A row of `secret_refs` (security schema). Holds no secret value."""
+
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    resource_name: str
+    version: str = Field(pattern=r"^[0-9]+$", description="a pinned version, never 'latest'")
+
+
+class Datasource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")
+    kind: str
+    secret_ref: Optional[SecretRef] = None
+    options: dict[str, Any] = Field(default_factory=dict)  # host, database, project, dataset, path ... never credentials
+
+
+SecretResolver = Callable[[SecretRef], str]
+Executor = Callable[[str], tuple[list[str], list[tuple]]]
+Connector = Callable[[Datasource, Optional[str]], Executor]
+
+
+def register_datasource(catalog: Catalog, ds: Datasource, actor: Optional[str] = None) -> dict[str, Any]:
+    """Validate and store a datasource. The catalog's dialect follows the datasource's kind."""
+    if ds.kind not in DIALECTS:
+        raise ModelError(f"unsupported warehouse kind {ds.kind!r}; pick one of {', '.join(DIALECTS)}", "invalid")
+    if ds.kind != "duckdb" and ds.secret_ref is None:
+        raise ModelError(f"a {ds.kind} datasource needs a secret_ref", "invalid")
+    if ds.secret_ref and not _RESOURCE_RE.match(ds.secret_ref.resource_name):
+        raise ModelError("secret_ref.resource_name must look like projects/<p>/secrets/<name>", "invalid")
+    bad = [k for k in ds.options if _SECRETISH.search(k)]
+    if bad:
+        raise ModelError(f"options {bad} look like credentials; put them in Secret Manager and pass a secret_ref", "invalid")
+    has_model = catalog.head() > 0 and catalog.load().cubes
+    if has_model and catalog.dialect != ds.kind:
+        raise ModelError(f"the model is written in {catalog.dialect} SQL; a {ds.kind} warehouse needs a new catalog", "invalid")
+    with catalog.transaction() as cat:
+        cat.db.execute(
+            "INSERT OR REPLACE INTO datasources (name, kind, secret_ref_id, secret_resource, secret_version, options, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ds.name, ds.kind, ds.secret_ref.id if ds.secret_ref else None,
+             ds.secret_ref.resource_name if ds.secret_ref else None, ds.secret_ref.version if ds.secret_ref else None,
+             json.dumps(ds.options, sort_keys=True), actor, _now()),
+        )
+        cat.db.execute("INSERT OR REPLACE INTO settings VALUES ('dialect', ?)", (ds.kind,))
+        cat.audit("data.datasource.register", actor, target_type="datasource", target_id=ds.name, kind=ds.kind,
+                  secret_ref_id=ds.secret_ref.id if ds.secret_ref else None)
+    return {"name": ds.name, "kind": ds.kind, "secret_ref_id": ds.secret_ref.id if ds.secret_ref else None}
+
+
+def get_datasource(catalog: Catalog, name: str = "primary") -> Datasource:
+    r = catalog.db.execute("SELECT * FROM datasources WHERE name = ?", (name,)).fetchone()
+    if r is None:
+        raise ModelError(f"no datasource {name!r}; connect a warehouse in the console", "no_datasource")
+    ref = SecretRef(id=r["secret_ref_id"], resource_name=r["secret_resource"], version=r["secret_version"]) if r["secret_ref_id"] else None
+    return Datasource(name=r["name"], kind=r["kind"], secret_ref=ref, options=json.loads(r["options"]))
+
+
+def duckdb_connector(ds: Datasource, secret: Optional[str]) -> Executor:
+    import duckdb
+
+    from .engine import duckdb_executor
+
+    return duckdb_executor(duckdb.connect(ds.options.get("path", ":memory:"), read_only=bool(ds.options.get("path"))))
+
+
+DEFAULT_CONNECTORS: dict[str, Connector] = {"duckdb": duckdb_connector}
+
+
+def open_executor(catalog: Catalog, resolve_secret: Optional[SecretResolver] = None, name: str = "primary",
+                  connectors: Optional[dict[str, Connector]] = None) -> Executor:
+    """Connect to a registered datasource. Postgres/BigQuery/ClickHouse connectors are passed in by the API."""
+    ds = get_datasource(catalog, name)
+    connector = {**DEFAULT_CONNECTORS, **(connectors or {})}.get(ds.kind)
+    if connector is None:
+        raise ModelError(f"no connector registered for {ds.kind}", "no_datasource")
+    secret = None
+    if ds.secret_ref:
+        if resolve_secret is None:
+            raise ModelError("this datasource needs a secret resolver", "no_datasource")
+        secret = resolve_secret(ds.secret_ref)
+    return connector(ds, secret)

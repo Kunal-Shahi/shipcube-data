@@ -13,9 +13,25 @@ Part of [ShipCube](https://github.com/Kunal-Shahi/shipcube).
 - [docs/QUERY.md](docs/QUERY.md) covers the query language (L0 typed, L1 operators, L2 stages, L3 raw SQL) and dialects.
 - [docs/MCP.md](docs/MCP.md) covers the MCP tools exposed to coding agents.
 
+## Use it from ShipCube
+
+The package needs Python 3.12. Add it as a git dependency:
+
+```toml
+dependencies = ["shipcube-data @ git+https://github.com/Kunal-Shahi/shipcube-data@main"]
+```
+
+Then import from the top-level package:
+
+```python
+from shipcube_data import DataTools, Caller, Catalog, DataLayer, MuseDrafter, ToolError
+```
+
+See [docs/MCP.md](docs/MCP.md#install-and-import) for how the MCP server mounts the `data_` tools, and how the console approves and applies migrations and connects warehouses.
+
 ## Quick start
 
-You need Python 3.11 or later. With [uv](https://docs.astral.sh/uv/):
+You need Python 3.12 or later. With [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv venv -p 3.12 .venv
@@ -86,7 +102,9 @@ src/shipcube_data/
   rawsql.py      L3 validator
   engine.py      DataLayer facade; result cache
   identity.py    Caller (security schema: workspace, membership role, token scopes) -> SecurityContext
-  tools.py       the six MCP tools as an in-process library (DataTools.specs / call)
+  tools.py       the five data_ MCP tools (DataTools.specs / call) + console-only approve / apply / register_datasource
+  drafting.py    drafting migrations from English or app code: Muse Spark hook, rule fallback, MockMuse
+  datasources.py warehouse connections from secret references; connector registry
   demo.py        Olist-shaped DuckDB warehouse
 examples/olist/migrations/   the demo model as migrations
 tests/

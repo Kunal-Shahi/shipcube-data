@@ -36,11 +36,20 @@ def console(role="admin", user=BOB, email="bob@acme.test"):
 
 def test_specs_are_json_schemas(tools):
     specs = {s["name"]: s for s in tools.specs()}
-    assert set(specs) == {"list_cubes", "describe_cube", "query", "search_values", "propose_migration", "apply_migration"}
+    assert set(specs) == {"data_list_cubes", "data_describe_cube", "data_query", "data_search_values", "data_propose_migration"}
     json.dumps(specs)  # serialisable as-is
-    assert specs["query"]["scope"] == "data:read" and specs["apply_migration"]["scope"] == "data:write"
-    assert "add_measure" in specs["propose_migration"]["inputSchema"]["properties"]["ops"]["items"]["discriminator"]["mapping"]
-    assert "measures" in json.dumps(specs["query"]["inputSchema"])
+    assert specs["data_query"]["scope"] == "data:read" and specs["data_propose_migration"]["scope"] == "data:write"
+    ops = specs["data_propose_migration"]["inputSchema"]["properties"]["ops"]["anyOf"][0]
+    assert "add_measure" in ops["items"]["discriminator"]["mapping"]
+    assert "measures" in json.dumps(specs["data_query"]["inputSchema"])
+
+
+def test_prefixed_and_bare_names_both_resolve_but_agents_cannot_apply(tools):
+    assert tools.call("data_list_cubes", {}, agent()) == tools.call("list_cubes", {}, agent())
+    for name in ("apply_migration", "data_apply_migration"):
+        with pytest.raises(ToolError) as e:
+            tools.call(name, {"id": "0006_x"}, agent())
+        assert e.value.code == "unknown_tool"
 
 
 def test_query_through_the_tool(tools):
@@ -126,15 +135,21 @@ def test_propose_approve_apply(tools, runner):
                                            "ops": [{"op": "add_measure", "name": "orders.unique_customers", "sql": "customer_id"}]}, agent())
     mid = out["id"]
     assert out["status"] == "proposed" and out["approval_url"].endswith(f"/w/{WS}/data/migrations/{mid}")
+    assert out["summary"] == ["[additive] Add measure orders.unique_customers = count_distinct(customer_id)"]
+    assert out["explained_by"] == "agent"
 
+    ana = console(role="developer", user=ANA, email="ana@acme.test")
     with pytest.raises(ToolError) as e:
-        tools.call("apply_migration", {"id": mid}, agent())
+        tools.apply(mid, ana)
     assert e.value.code == "needs_approval" and "console.shipcube.dev" in e.value.hint
-    with pytest.raises(ToolError, match="not with a token"):
-        tools.approve(mid, agent(role="owner"))
+    for who in (agent(role="owner"),):
+        with pytest.raises(ToolError, match="not with a token"):
+            tools.approve(mid, who)
+        with pytest.raises(ToolError, match="not with a token"):
+            tools.apply(mid, who)
     # The token's owner may approve their agent's proposal from the console: different principal.
-    tools.approve(mid, console(role="developer", user=ANA, email="ana@acme.test"))
-    applied = tools.call("apply_migration", {"id": mid}, agent())
+    tools.approve(mid, ana)
+    applied = tools.apply(mid, ana)
     assert applied["status"] == "applied" and applied["version"] == 6
 
     log = runner.catalog.audit_log()
@@ -154,5 +169,8 @@ def test_breaking_changes_need_an_admin_and_no_breaks(tools, runner):
         tools.approve(out["id"], console(role="developer"))
     tools.approve(out["id"], console(role="admin"))
     with pytest.raises(ToolError) as e:
-        tools.call("apply_migration", {"id": out["id"]}, agent())
+        tools.apply(out["id"], console(role="developer"))
     assert e.value.code == "would_break"
+    with pytest.raises(ToolError, match="needs admin"):
+        tools.apply(out["id"], console(role="developer"), allow_breaking=True)
+    assert tools.apply(out["id"], console(role="admin"), allow_breaking=True)["status"] == "applied"

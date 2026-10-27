@@ -86,4 +86,5 @@ def build(con, tenants: dict[str, tuple[int, int, int]] = TENANTS) -> None:
         con.executemany(f"INSERT INTO {s}.order_items VALUES (?, ?, ?, ?, ?, ?, ?)", items)
 
 
-MIGRATIONS = Path(__file__).resolve().parents[2] / "examples" / "olist" / "migrations"
+_PACKAGED = Path(__file__).resolve().parent / "examples" / "olist" / "migrations"  # installed wheel
+MIGRATIONS = _PACKAGED if _PACKAGED.is_dir() else Path(__file__).resolve().parents[2] / "examples" / "olist" / "migrations"
