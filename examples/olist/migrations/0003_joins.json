@@ -1,0 +1,9 @@
+{
+  "description": "How the cubes relate",
+  "ops": [
+    {"op": "add_join", "cube": "orders", "to": "customers", "key": "customer_id"},
+    {"op": "add_join", "cube": "customers", "to": "states", "on": "customers.customer_state = states.state_code"},
+    {"op": "add_join", "cube": "order_items", "to": "orders", "key": "order_id"},
+    {"op": "add_join", "cube": "order_items", "to": "products", "key": "product_id"}
+  ]
+}

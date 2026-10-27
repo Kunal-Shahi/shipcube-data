@@ -1,0 +1,8 @@
+{
+  "description": "orders is one table per month; order_items is partitioned by shipping date",
+  "ops": [
+    {"op": "define_partition", "cube": "orders", "dimension": "purchased_at",
+     "table_pattern": "orders_{yyyy}_{mm}", "start": "2017-01-01", "end": "2018-08-01"},
+    {"op": "define_partition", "cube": "order_items", "column": "shipping_limit_date", "granularity": "month"}
+  ]
+}

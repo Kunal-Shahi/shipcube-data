@@ -1,0 +1,9 @@
+{
+  "description": "Regional managers see their region's orders; freight is finance-only",
+  "ops": [
+    {"op": "add_row_policy", "name": "orders.own_region",
+     "filter": {"member": "states.region", "op": "equals", "values": ["$ctx.region"]},
+     "roles": ["regional_manager"]},
+    {"op": "grant_member", "member": "order_items.freight", "roles": ["finance"]}
+  ]
+}
