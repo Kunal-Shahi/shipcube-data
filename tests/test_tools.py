@@ -17,7 +17,7 @@ TOKEN = uuid4()
 @pytest.fixture
 def tools(runner, warehouse):
     cat = runner.catalog
-    cat.db.execute("INSERT OR REPLACE INTO settings VALUES ('workspace_id', ?)", (str(WS),))
+    cat.set_setting("workspace_id", str(WS))
     # Viewers from each customer's Google domain read that customer's schema.
     cat.set_attribute("domain", "acme.test", "tenant", "acme", by="user:admin")
     cat.set_attribute("domain", "globex.test", "tenant", "globex", by="user:admin")
@@ -102,6 +102,7 @@ def test_data_roles_and_attributes_drive_policies_and_grants(tools, runner):
 
 def test_workspace_roles_are_hierarchical_and_identity_wins(runner):
     cat = runner.catalog
+    cat.set_setting("workspace_id", str(WS))
     cat.set_attribute("domain", "acme.test", "email", "ceo@acme.test", by="user:admin")
     ctx = security_context(console(role="admin"), cat)
     assert {"workspace:admin", "workspace:developer", "workspace:viewer"} <= set(ctx.roles)

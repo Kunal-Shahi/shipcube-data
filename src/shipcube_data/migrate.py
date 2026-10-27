@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from .catalog import Catalog, _entities
+from .catalog import Catalog, _entities, _loads
 from .compiler import Compiler, SecurityContext
 from .model import Model, ModelError
 from .ops import Migration, apply_ops, conflicts
@@ -87,7 +87,7 @@ class Runner:
         base = self._base(m)
         clashes = []
         for rec in self.catalog.applied_since(base):
-            overlap = conflicts(touched, set(json.loads(rec["touches"])))
+            overlap = conflicts(touched, set(_loads(rec["touches"])))
             if overlap:
                 clashes.append({"migration": rec["id"], "version": rec["version"], "touches": sorted(overlap)})
         if clashes:
@@ -238,7 +238,7 @@ class Runner:
         if not rec:
             raise MigrationError(f"unknown migration {mid}", "not_found")
         return Migration.model_validate({"id": rec["id"], "description": rec["description"],
-                                         "base_version": rec["base_version"], "ops": json.loads(rec["ops"])})
+                                         "base_version": rec["base_version"], "ops": _loads(rec["ops"])})
 
     def _next_id(self, description: str) -> str:
         nums = [int(r["id"].split("_")[0]) for r in self.catalog.migrations() if r["id"][:4].isdigit()]

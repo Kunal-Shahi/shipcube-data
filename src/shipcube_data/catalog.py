@@ -12,202 +12,17 @@ until `until_version` (exclusive; NULL = still current). That gives us:
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Iterator
+from typing import Any, Optional
 
+from .db import Db, workspace_schema
 from .model import Cube, Dimension, Join, Measure, Model, ModelError, PartitionSpec, RowPolicy, SchemaBinding, Segment
 
-DDL = """
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS model_versions (
-    version        INTEGER PRIMARY KEY,
-    migration_id   TEXT NOT NULL,
-    fingerprint    TEXT NOT NULL,
-    applied_at     TEXT NOT NULL,
-    applied_by     TEXT,
-    rolled_back_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS migrations (
-    id           TEXT PRIMARY KEY,
-    description  TEXT NOT NULL DEFAULT '',
-    checksum     TEXT NOT NULL,
-    ops          TEXT NOT NULL,              -- JSON list of ops
-    touches      TEXT NOT NULL DEFAULT '[]', -- JSON list of touch keys
-    kind         TEXT NOT NULL,              -- additive | change | breaking
-    status       TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'applied', 'rolled_back', 'rejected')),
-    base_version INTEGER,
-    version      INTEGER,                    -- model version it produced
-    proposed_by  TEXT,
-    approved_by  TEXT,
-    impact       TEXT,                       -- JSON dry-run report
-    created_at   TEXT NOT NULL,
-    applied_at   TEXT
-);
-
-CREATE TABLE IF NOT EXISTS cubes (
-    name          TEXT NOT NULL,
-    table_name    TEXT,
-    sql           TEXT,
-    title         TEXT,
-    description   TEXT,
-    grants        TEXT,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (name, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS members (
-    cube          TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    kind          TEXT NOT NULL CHECK (kind IN ('measure', 'dimension')),
-    agg           TEXT,                      -- measures
-    type          TEXT,                      -- dimensions
-    sql           TEXT,
-    deprecated    TEXT,
-    grants        TEXT,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, name, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS member_aliases (
-    cube          TEXT NOT NULL,
-    alias         TEXT NOT NULL,
-    target        TEXT NOT NULL,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, alias, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS joins (
-    cube          TEXT NOT NULL,
-    target        TEXT NOT NULL,
-    relationship  TEXT NOT NULL,
-    on_sql        TEXT NOT NULL,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, target, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS segments (
-    cube          TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    sql           TEXT NOT NULL,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, name, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS partition_specs (
-    cube          TEXT NOT NULL,
-    column_name   TEXT NOT NULL,
-    kind          TEXT NOT NULL,
-    strategy      TEXT NOT NULL,
-    granularity   TEXT,
-    table_pattern TEXT,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS schema_bindings (
-    cube          TEXT NOT NULL,             -- '*' = every cube
-    tenant        TEXT NOT NULL,             -- '*' = every tenant
-    schema_name   TEXT NOT NULL,             -- may contain {tenant}
-    tenant_column TEXT,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, tenant, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS row_policies (
-    cube          TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    filter        TEXT NOT NULL,
-    roles         TEXT,
-    spec          TEXT NOT NULL,
-    since_version INTEGER NOT NULL,
-    until_version INTEGER,
-    PRIMARY KEY (cube, name, since_version)
-);
-
-CREATE TABLE IF NOT EXISTS saved_queries (
-    name       TEXT PRIMARY KEY,
-    app        TEXT,
-    query      TEXT NOT NULL,
-    tenant     TEXT,
-    roles      TEXT NOT NULL DEFAULT '[]',
-    created_by TEXT,
-    created_at TEXT NOT NULL
-);
-
--- Warehouse connections, created in the console. Credentials are referenced (security
--- schema's secret_refs), never stored.
-CREATE TABLE IF NOT EXISTS datasources (
-    name            TEXT PRIMARY KEY,
-    kind            TEXT NOT NULL,           -- duckdb | postgres | bigquery | clickhouse
-    secret_ref_id   TEXT,                    -- secret_refs.id
-    secret_resource TEXT,                    -- projects/<p>/secrets/<name>
-    secret_version  TEXT,                    -- pinned version
-    options         TEXT NOT NULL DEFAULT '{}',
-    created_by      TEXT,
-    created_at      TEXT NOT NULL
-);
-
--- Who holds which data role. Principals follow the security schema's conventions
--- (access_grants.principal_type): a user email, a Google group email, a domain, or a
--- workspace membership role (owner/admin/developer/viewer). Not versioned: people come
--- and go far more often than the model changes. Changes are audited.
-CREATE TABLE IF NOT EXISTS data_role_assignments (
-    principal_type TEXT NOT NULL CHECK (principal_type IN ('user', 'group', 'domain', 'workspace_role')),
-    principal      TEXT NOT NULL,            -- lower-cased email, group, domain or role
-    role           TEXT NOT NULL,            -- e.g. regional_manager, finance
-    granted_by     TEXT,
-    created_at     TEXT NOT NULL,
-    PRIMARY KEY (principal_type, principal, role)
-);
-
--- Values row policies read as $ctx.<key>, e.g. region = 'South' for one user or a whole domain.
--- The most specific principal wins: user > group > domain > workspace_role.
-CREATE TABLE IF NOT EXISTS data_attributes (
-    principal_type TEXT NOT NULL CHECK (principal_type IN ('user', 'group', 'domain', 'workspace_role')),
-    principal      TEXT NOT NULL,
-    key            TEXT NOT NULL,
-    value          TEXT NOT NULL,            -- JSON scalar or list
-    set_by         TEXT,
-    created_at     TEXT NOT NULL,
-    PRIMARY KEY (principal_type, principal, key)
-);
-
--- Same shape as the security schema's audit_log, so production can write to that table directly.
-CREATE TABLE IF NOT EXISTS audit_log (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    workspace_id   TEXT,
-    actor_user_id  TEXT,
-    actor_token_id TEXT,
-    actor_type     TEXT NOT NULL CHECK (actor_type IN ('user', 'token', 'system')),
-    action         TEXT NOT NULL,            -- data.migration.apply, data.role.assign, ...
-    target_type    TEXT NOT NULL,
-    target_id      TEXT NOT NULL,
-    detail         TEXT NOT NULL DEFAULT '{}',
-    at             TEXT NOT NULL
-);
-"""
-
+# The catalog schema itself lives in versioned migrations: catalog_migrations/<backend>/NNNN_*.sql.
+# These are the SCD2 model tables and the key that identifies one row's current version.
 CURRENT_UNIQUE = {
     "cubes": "name",
     "members": "cube, name",
@@ -226,6 +41,11 @@ def _now() -> str:
 
 def _j(v: Any) -> str:
     return json.dumps(v, sort_keys=True)
+
+
+def _loads(v: Any) -> Any:
+    """JSON columns are TEXT on SQLite and JSONB (already decoded) on Postgres."""
+    return json.loads(v) if isinstance(v, (str, bytes)) else v
 
 
 Row = dict[str, Any]
@@ -279,18 +99,30 @@ KEY_COLS = {t: [c.strip() for c in cols.split(",")] for t, cols in CURRENT_UNIQU
 
 
 class Catalog:
-    def __init__(self, path: str | Path = ":memory:", dialect: str = "duckdb", workspace_id: Optional[str] = None):
-        self.path = str(path)
-        self.db = sqlite3.connect(self.path, isolation_level=None)  # explicit transactions only
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
-        self.db.executescript(DDL)
-        for table, cols in CURRENT_UNIQUE.items():
-            self.db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_current ON {table} ({cols}) WHERE until_version IS NULL")
-        self.db.execute("INSERT OR IGNORE INTO settings VALUES ('dialect', ?)", (dialect,))
+    """One workspace's catalog.
+
+    `url` is a SQLite path (":memory:" by default) or a `postgresql://` URL. On Postgres each
+    workspace gets its own schema, `catalog_ws_<uuid hex>`. Pending catalog-schema migrations
+    are applied on open unless `migrate=False` (production runs them in a deploy step:
+    `shipcube-data catalog-migrate`). One Catalog holds one connection: use one per thread.
+    """
+
+    def __init__(self, url: str | Path = ":memory:", dialect: str = "duckdb", workspace_id: Optional[str] = None,
+                 migrate: bool = True):
+        self.url = str(url)
+        self.db = Db(self.url, schema=workspace_schema(str(workspace_id) if workspace_id else None))
+        if migrate:
+            self.db.migrate_schema()
+        self.db.execute("INSERT INTO settings (key, value) VALUES ('dialect', ?) ON CONFLICT (key) DO NOTHING", (dialect,))
         if workspace_id:
-            self.db.execute("INSERT OR IGNORE INTO settings VALUES ('workspace_id', ?)", (str(workspace_id),))
+            self.db.execute("INSERT INTO settings (key, value) VALUES ('workspace_id', ?) ON CONFLICT (key) DO NOTHING", (str(workspace_id),))
         self._cache: dict[int, Model] = {}
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.db.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", (key, value))
+
+    def close(self) -> None:
+        self.db.close()
 
     # ------------------------------------------------------------ settings & versions
 
@@ -320,16 +152,16 @@ class Catalog:
         if v in self._cache:
             return self._cache[v].model_copy(deep=True)
 
-        def rows(table: str) -> Iterator[sqlite3.Row]:
+        def rows(table: str):
             return self.db.execute(
                 f"SELECT * FROM {table} WHERE since_version <= ? AND (until_version IS NULL OR until_version > ?)", (v, v)
             )
 
         model = Model()
         for r in rows("cubes"):
-            model.cubes[r["name"]] = Cube(**json.loads(r["spec"]))
+            model.cubes[r["name"]] = Cube(**_loads(r["spec"]))
         for r in rows("members"):
-            spec = json.loads(r["spec"])
+            spec = _loads(r["spec"])
             cube = model.cubes[r["cube"]]
             if r["kind"] == "measure":
                 cube.measures[r["name"]] = Measure(**spec)
@@ -338,16 +170,16 @@ class Catalog:
         for r in rows("member_aliases"):
             model.cubes[r["cube"]].aliases[r["alias"]] = r["target"]
         for r in rows("joins"):
-            model.cubes[r["cube"]].joins[r["target"]] = Join(**json.loads(r["spec"]))
+            model.cubes[r["cube"]].joins[r["target"]] = Join(**_loads(r["spec"]))
         for r in rows("segments"):
-            model.cubes[r["cube"]].segments[r["name"]] = Segment(**json.loads(r["spec"]))
+            model.cubes[r["cube"]].segments[r["name"]] = Segment(**_loads(r["spec"]))
         for r in rows("partition_specs"):
-            model.cubes[r["cube"]].partition = PartitionSpec(**json.loads(r["spec"]))
+            model.cubes[r["cube"]].partition = PartitionSpec(**_loads(r["spec"]))
         for r in rows("schema_bindings"):
-            b = SchemaBinding(**json.loads(r["spec"]))
+            b = SchemaBinding(**_loads(r["spec"]))
             model.bindings[b.key] = b
         for r in rows("row_policies"):
-            p = RowPolicy(**json.loads(r["spec"]))
+            p = RowPolicy(**_loads(r["spec"]))
             model.policies[p.key] = p
         # Keep member order stable regardless of row order.
         for cube in model.cubes.values():
@@ -451,7 +283,8 @@ class Catalog:
 
     def assign_role(self, principal_type: str, principal: str, role: str, by: Optional[str] = None) -> None:
         with self.transaction():
-            self.db.execute("INSERT OR IGNORE INTO data_role_assignments VALUES (?, ?, ?, ?, ?)",
+            self.db.execute("INSERT INTO data_role_assignments (principal_type, principal, role, granted_by, created_at) "
+                            "VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                             (principal_type, principal.lower(), role, by, _now()))
             self.audit("data.role.assign", by, target_type="data_role", target_id=role,
                        principal=f"{principal_type}:{principal.lower()}")
@@ -465,7 +298,9 @@ class Catalog:
 
     def set_attribute(self, principal_type: str, principal: str, key: str, value: Any, by: Optional[str] = None) -> None:
         with self.transaction():
-            self.db.execute("INSERT OR REPLACE INTO data_attributes VALUES (?, ?, ?, ?, ?, ?)",
+            self.db.execute("INSERT INTO data_attributes (principal_type, principal, key, value, set_by, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (principal_type, principal, key) "
+                            "DO UPDATE SET value = excluded.value, set_by = excluded.set_by, created_at = excluded.created_at",
                             (principal_type, principal.lower(), key, json.dumps(value), by, _now()))
             self.audit("data.attribute.set", by, target_type="data_attribute", target_id=key,
                        principal=f"{principal_type}:{principal.lower()}")
@@ -480,8 +315,8 @@ class Catalog:
         rank = {"workspace_role": 0, "domain": 1, "group": 2, "user": 3}
         attrs: dict[str, Any] = {}
         rows = self.db.execute(f"SELECT principal_type, key, value FROM data_attributes WHERE {where}", args).fetchall()
-        for ptype, key, value in sorted(rows, key=lambda r: rank[r[0]]):
-            attrs[key] = json.loads(value)
+        for r in sorted(rows, key=lambda r: rank[r["principal_type"]]):
+            attrs[r["key"]] = json.loads(r["value"])
         return roles, attrs
 
     def audit_log(self) -> list[Row]:
@@ -490,7 +325,9 @@ class Catalog:
     def save_query(self, name: str, query: dict, app: Optional[str] = None, tenant: Optional[str] = None,
                    roles: list[str] | None = None, created_by: Optional[str] = None) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO saved_queries (name, app, query, tenant, roles, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO saved_queries (name, app, query, tenant, roles, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (name) DO UPDATE SET app = excluded.app, query = excluded.query, tenant = excluded.tenant, "
+            "roles = excluded.roles, created_by = excluded.created_by, created_at = excluded.created_at",
             (name, app, _j(query), tenant, _j(roles or []), created_by, _now()),
         )
 
@@ -498,12 +335,19 @@ class Catalog:
         out = []
         for r in self.db.execute("SELECT * FROM saved_queries ORDER BY name"):
             d = dict(r)
-            d["query"], d["roles"] = json.loads(d["query"]), json.loads(d["roles"])
+            d["query"], d["roles"] = _loads(d["query"]), _loads(d["roles"])
             out.append(d)
         return out
 
-    def transaction(self) -> "_Tx":
-        return _Tx(self)
+    @contextmanager
+    def transaction(self, lock: bool = True) -> Iterator["Catalog"]:
+        """A write transaction holding this catalog's lock; nested calls join the outer one."""
+        try:
+            with self.db.transaction(lock=lock):
+                yield self
+        except BaseException:
+            self._cache.clear()
+            raise
 
     def history(self, cube: str, member: str) -> list[Row]:
         return [
@@ -513,20 +357,3 @@ class Catalog:
                 (cube, member),
             )
         ]
-
-
-class _Tx:
-    def __init__(self, catalog: Catalog):
-        self.catalog = catalog
-
-    def __enter__(self) -> Catalog:
-        self.catalog.db.execute("BEGIN IMMEDIATE")
-        return self.catalog
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type:
-            self.catalog.db.execute("ROLLBACK")
-            self.catalog._cache.clear()
-        else:
-            self.catalog.db.execute("COMMIT")
-

@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .catalog import Catalog, _now
+from .catalog import Catalog, _loads, _now
 from .compiler import DIALECTS
 from .model import ModelError
 
@@ -60,13 +60,16 @@ def register_datasource(catalog: Catalog, ds: Datasource, actor: Optional[str] =
         raise ModelError(f"the model is written in {catalog.dialect} SQL; a {ds.kind} warehouse needs a new catalog", "invalid")
     with catalog.transaction() as cat:
         cat.db.execute(
-            "INSERT OR REPLACE INTO datasources (name, kind, secret_ref_id, secret_resource, secret_version, options, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO datasources (name, kind, secret_ref_id, secret_resource, secret_version, options, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, "
+            "secret_ref_id = excluded.secret_ref_id, secret_resource = excluded.secret_resource, "
+            "secret_version = excluded.secret_version, options = excluded.options, "
+            "created_by = excluded.created_by, created_at = excluded.created_at",
             (ds.name, ds.kind, ds.secret_ref.id if ds.secret_ref else None,
              ds.secret_ref.resource_name if ds.secret_ref else None, ds.secret_ref.version if ds.secret_ref else None,
              json.dumps(ds.options, sort_keys=True), actor, _now()),
         )
-        cat.db.execute("INSERT OR REPLACE INTO settings VALUES ('dialect', ?)", (ds.kind,))
+        cat.set_setting("dialect", ds.kind)
         cat.audit("data.datasource.register", actor, target_type="datasource", target_id=ds.name, kind=ds.kind,
                   secret_ref_id=ds.secret_ref.id if ds.secret_ref else None)
     return {"name": ds.name, "kind": ds.kind, "secret_ref_id": ds.secret_ref.id if ds.secret_ref else None}
@@ -77,7 +80,7 @@ def get_datasource(catalog: Catalog, name: str = "primary") -> Datasource:
     if r is None:
         raise ModelError(f"no datasource {name!r}; connect a warehouse in the console", "no_datasource")
     ref = SecretRef(id=r["secret_ref_id"], resource_name=r["secret_resource"], version=r["secret_version"]) if r["secret_ref_id"] else None
-    return Datasource(name=r["name"], kind=r["kind"], secret_ref=ref, options=json.loads(r["options"]))
+    return Datasource(name=r["name"], kind=r["kind"], secret_ref=ref, options=_loads(r["options"]))
 
 
 def duckdb_connector(ds: Datasource, secret: Optional[str]) -> Executor:

@@ -1,3 +1,6 @@
+import os
+import uuid
+
 import duckdb
 import pytest
 
@@ -16,9 +19,23 @@ def warehouse():
     con.close()
 
 
-@pytest.fixture
-def catalog():
-    return Catalog()
+PG_URL = os.environ.get("SHIPCUBE_TEST_PG_URL")  # e.g. postgresql://postgres@localhost:5432/postgres
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def catalog(request):
+    """Every catalog-backed test runs on SQLite and, when SHIPCUBE_TEST_PG_URL is set, on Postgres."""
+    if request.param == "sqlite":
+        cat = Catalog()
+        yield cat
+        cat.close()
+        return
+    if not PG_URL:
+        pytest.skip("SHIPCUBE_TEST_PG_URL not set")
+    cat = Catalog(PG_URL, workspace_id=str(uuid.uuid4()))
+    yield cat
+    cat.db.execute(f'DROP SCHEMA "{cat.db.schema}" CASCADE')
+    cat.close()
 
 
 @pytest.fixture
