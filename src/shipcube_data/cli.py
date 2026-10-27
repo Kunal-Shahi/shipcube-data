@@ -23,6 +23,10 @@ from .migrate import Runner, load_dir
 from .model import ModelError
 
 
+def _no_warehouse(sql, limits, query_id):
+    raise ModelError("compile-only: no warehouse connected", "no_datasource")
+
+
 def _print(obj: Any) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
@@ -82,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             if a.cmd == "sql":
                 from .engine import DataLayer
 
-                compiled, _ = DataLayer(cat, lambda s: ([], [])).compile(query, ctx, a.dialect)
+                compiled, _ = DataLayer(cat, _no_warehouse).compile(query, ctx, a.dialect)
                 print(compiled.sql)
                 for w in compiled.warnings:
                     print(f"-- warning: {w}", file=sys.stderr)

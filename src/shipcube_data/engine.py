@@ -13,17 +13,14 @@ from .catalog import Catalog
 from .compiler import Compiler, SecurityContext
 from .migrate import Runner
 from .model import Model, ModelError, humanize
+from .obs import Metrics, NoMetrics, Timer, log_event, new_query_id, sql_hash
 from .query import Condition, Order, Query
-
-Executor = Callable[[str], tuple[list[str], list[tuple]]]
+from .warehouses import DuckDBWarehouse, Executor, QueryLimits
 
 
 def duckdb_executor(con) -> Executor:
-    def run(sql: str) -> tuple[list[str], list[tuple]]:
-        cur = con.execute(sql)
-        return [d[0] for d in cur.description], cur.fetchall()
-
-    return run
+    """A guarded executor over a DuckDB connection (local development and tests)."""
+    return DuckDBWarehouse(con)
 
 
 class ResultCache:
@@ -65,17 +62,20 @@ class ResultCache:
 
 
 class DataLayer:
-    def __init__(self, catalog: Catalog, execute: Executor, cache: Optional[ResultCache] = None):
+    def __init__(self, catalog: Catalog, execute: Executor, cache: Optional[ResultCache] = None,
+                 limits: Optional[QueryLimits] = None, metrics: Optional[Metrics] = None):
         self.catalog, self.execute = catalog, execute
         self.cache = cache or ResultCache()
+        self.limits = limits or QueryLimits.from_env()
+        self.metrics = metrics or NoMetrics()
         self.runner = Runner(catalog)
 
     @classmethod
-    def from_catalog(cls, catalog: Catalog, resolve_secret=None, connectors=None, datasource: str = "primary") -> "DataLayer":
+    def from_catalog(cls, catalog: Catalog, resolve_secret=None, connectors=None, datasource: str = "primary", **kwargs) -> "DataLayer":
         """Build a DataLayer that queries the catalog's registered datasource (see datasources.py)."""
         from .datasources import open_executor
 
-        return cls(catalog, open_executor(catalog, resolve_secret, datasource, connectors))
+        return cls(catalog, open_executor(catalog, resolve_secret, datasource, connectors), **kwargs)
 
     @property
     def dialect(self) -> str:
@@ -151,28 +151,59 @@ class DataLayer:
         return Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q), q
 
     def query(self, query: Query | dict, ctx: SecurityContext, *, use_cache: bool = True) -> dict[str, Any]:
-        compiled, q = self.compile(query, ctx)
-        version = q.model_version or self.catalog.head()
-        key = ResultCache.key(compiled.fingerprint, q, ctx, self.dialect)
-        cached = self.cache.get(key) if use_cache else None
-        if cached is None:
-            names, rows = self.execute(compiled.sql)
-            cached = [dict(zip(names, r)) for r in rows]
-            if use_cache:
-                self.cache.put(key, cached)
-            hit = False
-        else:
-            hit = True
+        """Compile, run under the guardrails, and log one `query.ok` / `query.error` event."""
+        query_id = new_query_id()
+        timer = Timer().__enter__()
+        fields: dict[str, Any] = {"query_id": query_id, "tenant": ctx.tenant, "workspace_id": ctx.attrs.get("workspace_id"),
+                                  "user": ctx.user, "dialect": self.dialect}
+        try:
+            q = query if isinstance(query, Query) else Query.model_validate(query)
+            if q.limit and q.limit > self.limits.max_rows:
+                raise ModelError(f"limit {q.limit} is over this workspace's row limit of {self.limits.max_rows}", "invalid")
+            if not q.limit:
+                q = q.model_copy(update={"limit": self.limits.max_rows})
+            compiled, q = self.compile(q, ctx)
+            version = q.model_version or self.catalog.head()
+            fields |= {"cubes": compiled.cubes, "fingerprint": compiled.fingerprint, "model_version": version,
+                       "sql_hash": sql_hash(compiled.sql),
+                       "partitions_scanned": {c: p.get("scanned") for c, p in compiled.partitions.items()}}
+            key = ResultCache.key(compiled.fingerprint, q, ctx, self.dialect)
+            cached = self.cache.get(key) if use_cache else None
+            stats: dict[str, Any] = {}
+            truncated = False
+            if cached is None:
+                res = self.execute(compiled.sql, self.limits, query_id)
+                rows, truncated, stats = [dict(zip(res.columns, r)) for r in res.rows], res.truncated, res.stats
+                if use_cache and not truncated:
+                    self.cache.put(key, rows)
+                hit = False
+            else:
+                rows, hit = cached, True
+        except ModelError as e:
+            log_event("query.error", level=30, **fields, code=e.code, error=str(e)[:300], elapsed_ms=timer.elapsed_ms)
+            self.metrics.incr("data_query_errors_total", code=e.code)
+            raise
+        warnings = list(compiled.warnings)
+        if truncated:
+            warnings.append(f"result truncated at {self.limits.max_rows} rows; add filters or a smaller limit")
+        elapsed = timer.elapsed_ms
+        log_event("query.ok", **fields, rows=len(rows), truncated=truncated, cache="hit" if hit else "miss",
+                  elapsed_ms=elapsed, **{f"wh_{k}": v for k, v in stats.items()})
+        self.metrics.observe("data_query_duration_ms", elapsed, cache="hit" if hit else "miss")
+        self.metrics.incr("data_queries_total", cache="hit" if hit else "miss")
         return {
+            "query_id": query_id,
             "columns": [c.__dict__ for c in compiled.columns],
-            "rows": cached,
+            "rows": rows,
+            "truncated": truncated,
             "sql": compiled.sql,
             "model_version": version,
             "fingerprint": compiled.fingerprint,
             "partitions": compiled.partitions,
-            "warnings": compiled.warnings,
+            "warnings": warnings,
             "verified": True,
             "cache": "hit" if hit else "miss",
+            "stats": {"elapsed_ms": elapsed, **stats},
         }
 
     def search_values(self, dimension: str, text: str = "", ctx: Optional[SecurityContext] = None, limit: int = 20) -> list[Any]:
@@ -188,7 +219,15 @@ class DataLayer:
         return [r[col] for r in res["rows"]]
 
     def raw_sql(self, sql: str, ctx: SecurityContext, limit: int = 1000) -> dict[str, Any]:
-        safe = rawsql.validate(sql, self._model(), ctx, self.dialect, limit)
-        names, rows = self.execute(safe)
-        return {"columns": [{"name": n} for n in names], "rows": [dict(zip(names, r)) for r in rows], "sql": safe,
+        query_id = new_query_id()
+        limit = min(limit, self.limits.max_rows)
+        try:
+            safe = rawsql.validate(sql, self._model(), ctx, self.dialect, limit)
+            res = self.execute(safe, self.limits, query_id)
+        except ModelError as e:
+            log_event("raw_sql.error", level=30, query_id=query_id, tenant=ctx.tenant, code=e.code, error=str(e)[:300])
+            raise
+        log_event("raw_sql.ok", query_id=query_id, tenant=ctx.tenant, user=ctx.user, sql_hash=sql_hash(safe), rows=len(res.rows))
+        return {"query_id": query_id, "columns": [{"name": n} for n in res.columns],
+                "rows": [dict(zip(res.columns, r)) for r in res.rows], "sql": safe, "truncated": res.truncated,
                 "verified": False, "warnings": ["raw SQL: not checked against the semantic model; numbers may not match governed metrics"]}

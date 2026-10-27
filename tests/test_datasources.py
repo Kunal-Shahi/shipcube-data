@@ -1,5 +1,7 @@
 import pytest
 
+from shipcube_data.warehouses import ExecResult
+
 from shipcube_data import Catalog, DataLayer
 from shipcube_data.datasources import get_datasource, open_executor
 
@@ -31,7 +33,8 @@ def test_only_console_admins_connect_warehouses(tools, who, error):  # noqa: F81
     ({"kind": "postgres", "secret_ref": {**REF, "resource_name": "my-password"}}, "projects/<p>/secrets"),
     ({"kind": "postgres", "secret_ref": REF, "options": {"host": "db", "password": "hunter2"}}, "look like credentials"),
     ({"kind": "oracle", "secret_ref": REF}, "unsupported warehouse kind"),
-    ({"kind": "bigquery", "secret_ref": REF}, "model is written in duckdb"),
+    ({"kind": "bigquery", "options": {"location": "US"}}, "needs options.project"),
+    ({"kind": "bigquery", "options": {"project": "p"}}, "model is written in duckdb"),
 ])
 def test_registration_is_validated(tools, kwargs, error):  # noqa: F811
     with pytest.raises(ToolError, match=error):
@@ -54,10 +57,10 @@ def test_secret_is_resolved_only_at_connect_time(tmp_path):
 
     def fake_pg(ds, secret):
         seen["secret"] = secret
-        return lambda sql: (["one"], [(1,)])
+        return lambda sql, limits, query_id: ExecResult(["one"], [(1,)])
 
     layer = DataLayer.from_catalog(cat, resolve, connectors={"postgres": fake_pg})
-    assert layer.execute("SELECT 1") == (["one"], [(1,)])
+    assert layer.execute("SELECT 1", layer.limits, "q_1").rows == [(1,)]
     assert seen == {"ref": REF["resource_name"] + "@3", "secret": "postgres://app:hunter2@10.0.0.5/warehouse"}
     assert get_datasource(cat).secret_ref.id == REF["id"]
 

@@ -12,7 +12,10 @@ dependencies = [
 
 [project.optional-dependencies]
 duckdb = ["duckdb>=1.0"]
-dev = ["duckdb>=1.0", "pytest>=8.0"]
+postgres = ["psycopg[binary]>=3.2"]
+bigquery = ["google-cloud-bigquery>=3.25"]
+all = ["duckdb>=1.0", "psycopg[binary]>=3.2", "google-cloud-bigquery>=3.25"]
+dev = ["duckdb>=1.0", "psycopg[binary]>=3.2", "google-cloud-bigquery>=3.25", "pytest>=8.0"]
 
 [project.scripts]
 shipcube-data = "shipcube_data.cli:main"
@@ -29,3 +32,4 @@ packages = ["src/shipcube_data"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: talks to a real warehouse (Postgres via SHIPCUBE_TEST_PG_URL, BigQuery via SHIPCUBE_TEST_BQ_PROJECT)"]

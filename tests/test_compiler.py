@@ -51,7 +51,7 @@ def test_cross_schema_join_and_values(dl, acme, warehouse):
 def test_multi_fact_query_does_not_fan_out(dl, acme, warehouse):
     res = dl.query({"measures": ["orders.count", "order_items.revenue"], "dimensions": ["customers.state"]}, acme)
     sp = next(r for r in res["rows"] if r["customers__state"] == "SP")
-    assert "FULL OUTER JOIN" in res["sql"]
+    assert "keys AS (" in res["sql"] and "UNION" in res["sql"]
     want_orders = scalar(warehouse, f"SELECT COUNT(*) FROM ({ORDERS_ACME}) o JOIN tenant_acme.customers c USING (customer_id) WHERE c.customer_state = 'SP'")
     want_rev = scalar(warehouse, f"SELECT SUM(i.price) FROM tenant_acme.order_items i JOIN ({ORDERS_ACME}) o USING (order_id) JOIN tenant_acme.customers c USING (customer_id) WHERE c.customer_state = 'SP'")
     assert (sp["orders__count"], sp["order_items__revenue"]) == (want_orders, want_rev)
@@ -340,3 +340,9 @@ def test_raw_sql_refused_when_row_policies_apply(dl):
 def test_decimal_results_are_exact(dl, acme):
     rev = dl.query({"measures": ["order_items.revenue"]}, acme)["rows"][0]["order_items__revenue"]
     assert isinstance(rev, Decimal)
+
+
+def test_order_by_time_member_path(dl, acme):
+    res = dl.query({"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": "year"},
+                    "order": [{"member": "orders.purchased_at", "dir": "desc"}]}, acme)
+    assert [r["orders__purchased_at__year"].year for r in res["rows"]] == [2018, 2017]

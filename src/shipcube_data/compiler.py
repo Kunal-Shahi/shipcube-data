@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from sqlglot import exp
 
 from .model import ADDITIVE_AGGS, FANOUT_SAFE_AGGS, IDENT, Cube, Dimension, Measure, Member, Model, ModelError, humanize
-from .partitions import Bounds, prune, to_date
+from .partitions import Bounds, prune, timestamp_type, to_date
 from .query import And, Calc, Condition, Filter, Not, Or, Query, filter_members, parse_filter
 from .sqlutil import parse_expr, parse_query, ref_name, refs
 
@@ -293,7 +293,7 @@ class Compiler:
                     t.set("db", exp.to_identifier(schema))
             src: exp.Expression = exp.Subquery(this=q, alias=alias)
         elif spec and spec.strategy == "table":
-            pruned = prune(spec, exp.column(spec.column, cube.name), bounds, cube.name)
+            pruned = prune(spec, exp.column(spec.column, cube.name), bounds, cube.name, self.dialect)
             self.warnings.extend(pruned.notes)
             self.partitions[cube.name] = {"strategy": "table", "total": pruned.total, "scanned": pruned.scanned, "tables": pruned.tables}
             names = pruned.tables or []
@@ -310,7 +310,7 @@ class Compiler:
             t.set("alias", alias)
             src = t
         if spec and spec.strategy == "column":
-            pruned = prune(spec, exp.column(spec.column, cube.name), bounds, cube.name)
+            pruned = prune(spec, exp.column(spec.column, cube.name), bounds, cube.name, self.dialect)
             self.warnings.extend(pruned.notes)
             self.partitions[cube.name] = {"strategy": "column", "predicate": pruned.predicate.sql(self.dialect) if pruned.predicate else None}
             if pruned.predicate is not None:
@@ -326,7 +326,7 @@ class Compiler:
             return exp.Literal.number(v)
         lit = exp.Literal.string(str(v))
         if getattr(ref.member, "type", None) == "time":
-            return exp.cast(lit, "TIMESTAMP")
+            return exp.cast(lit, timestamp_type(self.dialect))
         return lit
 
     def condition(self, c: Condition) -> exp.Expression:
@@ -475,7 +475,11 @@ class Compiler:
             columns += calc_cols
 
         order = q.order or self._default_order(dims, measures, time_ref)
-        names = {c.member: c.name for c in columns if c.kind != "calc" and not c.granularity} | {c.name: c.name for c in columns}
+        names = {c.member: c.name for c in columns if c.kind != "calc" and not c.granularity}
+        for c in columns:  # ordering by a time member's path means its truncated column
+            if c.granularity:
+                names.setdefault(c.member, c.name)
+        names |= {c.name: c.name for c in columns}
         for o in order:
             key = o.member if o.member in names else output_alias(o.member)
             if key not in names:
@@ -568,30 +572,37 @@ class Compiler:
             sel = sel.having(exp.and_(*[self.filter_sql(f) for f in measure_filters]))
         return sel, {root} | {e.dst for e in tree}
 
+    def _shift(self, col: exp.Expression, n: int, granularity: str) -> exp.Expression:
+        return _shift_expr(col, n, granularity, self.dialect)
+
     def _fanout_safe(self, r: _Ref) -> bool:
         return getattr(r.member, "agg", None) in FANOUT_SAFE_AGGS
 
     def _stitch(self, selects, dims: list[_Ref], measures: list[_Ref], measure_filters: list[Filter]) -> exp.Select:
-        """Join per-cube aggregates on the dimensions (avoids fan-out across facts)."""
+        """Join per-cube aggregates on the dimensions (avoids fan-out across facts).
+
+        A `keys` CTE is the UNION of every group's dimension values; each group is LEFT JOINed to
+        it null-safely. (FULL JOIN on IS NOT DISTINCT FROM is not supported by Postgres.)
+        """
         names = [f"g_{root}" for root, _ in selects]
-        out = exp.select(*[
-            exp.Coalesce(this=exp.column(d.alias, names[0]), expressions=[exp.column(d.alias, n) for n in names[1:]]).as_(d.alias)
-            for d in dims
-        ])
         by_root = {r.path: f"g_{r.cube.name}" for r in measures}
-        out = out.select(*[exp.column(m.alias, by_root[m.path]).as_(m.alias) for m in measures])
-        out = out.from_(names[0])
-        for i, n in enumerate(names[1:], start=1):
-            if dims:
-                conds = []
-                for d in dims:
-                    left = exp.Coalesce(this=exp.column(d.alias, names[0]), expressions=[exp.column(d.alias, x) for x in names[1:i]]) if i > 1 else exp.column(d.alias, names[0])
-                    conds.append(exp.NullSafeEQ(this=left, expression=exp.column(d.alias, n)))
-                out = out.join(n, on=exp.and_(*conds), join_type="FULL OUTER")
-            else:
+        if dims:
+            keys: exp.Expression = exp.select(*[exp.column(d.alias) for d in dims]).from_(names[0])
+            for n in names[1:]:
+                keys = exp.union(keys, exp.select(*[exp.column(d.alias) for d in dims]).from_(n), distinct=True)
+            out = exp.select(*[exp.column(d.alias, "keys").as_(d.alias) for d in dims])
+            out = out.select(*[exp.column(m.alias, by_root[m.path]).as_(m.alias) for m in measures]).from_("keys")
+            for n in names:
+                on = exp.and_(*[exp.NullSafeEQ(this=exp.column(d.alias, n), expression=exp.column(d.alias, "keys")) for d in dims])
+                out = out.join(n, on=on, join_type="LEFT")
+        else:
+            out = exp.select(*[exp.column(m.alias, by_root[m.path]).as_(m.alias) for m in measures]).from_(names[0])
+            for n in names[1:]:
                 out = out.join(n, join_type="CROSS")
         for name, (_, sel) in zip(names, selects):
             out = out.with_(name, as_=sel)
+        if dims:
+            out = out.with_("keys", as_=keys)
         if measure_filters:
             # Measure filters see the stitched columns.
             alias_of = {m.path: exp.column(m.alias, by_root[m.path]) for m in measures}
@@ -671,7 +682,7 @@ class Compiler:
                 e = win(exp.Sum(this=val.copy()), order=t, frame=True)
             else:  # compare: period-over-period through a self-join, so gaps in the series stay correct
                 p = f"p{i}"
-                shifted = exp.DateAdd(this=exp.column(time_ref.alias, p), expression=exp.Literal.number(c.offset), unit=exp.Var(this=time_ref.granularity.upper()))  # type: ignore[union-attr]
+                shifted = self._shift(exp.column(time_ref.alias, p), c.offset, time_ref.granularity)  # type: ignore[arg-type,union-attr]
                 conds = [exp.EQ(this=shifted, expression=t.copy())]  # type: ignore[union-attr]
                 for d in dims:
                     if d is not time_ref:
@@ -687,6 +698,13 @@ class Compiler:
             out = out.select(e.as_(c.name))
             cols.append(Column(c.name, c.measure, "calc", "number", humanize(c.name)))
         return out.with_("base", as_=body), cols
+
+
+def _shift_expr(col: exp.Expression, n: int, granularity: str, dialect: str) -> exp.Expression:
+    unit = exp.Var(this=granularity.upper())
+    if dialect == "bigquery":  # TIMESTAMP_ADD has no MONTH/YEAR; go through DATETIME
+        return exp.cast(exp.DatetimeAdd(this=exp.cast(col, "DATETIME"), expression=exp.Literal.number(n), unit=unit), "TIMESTAMPTZ")
+    return exp.DateAdd(this=col, expression=exp.Literal.number(n), unit=unit)
 
 
 def table_from_pattern(spec) -> str:

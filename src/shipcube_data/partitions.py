@@ -49,6 +49,11 @@ class Pruned:
     notes: list[str] = field(default_factory=list)
 
 
+def timestamp_type(dialect: str) -> str:
+    """The type for timestamp literals. BigQuery's TIMESTAMP is sqlglot's TIMESTAMPTZ (its DATETIME is naive)."""
+    return "TIMESTAMPTZ" if dialect == "bigquery" else "TIMESTAMP"
+
+
 def to_date(value: str) -> date:
     try:
         return datetime.fromisoformat(str(value)).date()
@@ -90,14 +95,14 @@ def table_name(pattern: str, start: Optional[date] = None, value: Optional[str] 
     return name
 
 
-def prune(spec: PartitionSpec, column: exp.Expression, bounds: Bounds, cube: str) -> Pruned:
+def prune(spec: PartitionSpec, column: exp.Expression, bounds: Bounds, cube: str, dialect: str = "duckdb") -> Pruned:
     if spec.require_filter and not bounds.bounded:
         raise ModelError(f"{cube} is partitioned by {spec.column}; filter on it (require_filter is set)", "partition_filter_required")
 
     if spec.strategy == "column":
         if spec.kind == "list" or not bounds.bounded:
             return Pruned(notes=[] if bounds.bounded else [f"{cube}: no filter on partition column {spec.column}; full scan"])
-        cast_to = "DATE" if spec.column_type == "date" else "TIMESTAMP"
+        cast_to = "DATE" if spec.column_type == "date" else timestamp_type(dialect)
         parts = []
         if bounds.lo:
             parts.append(column.copy() >= exp.cast(exp.Literal.string(bounds.lo.isoformat()), cast_to))

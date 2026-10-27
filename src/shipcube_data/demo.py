@@ -14,6 +14,8 @@ instead. Layout:
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass, field
+from decimal import Decimal
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,35 +42,40 @@ def _uid(rng: random.Random) -> str:
     return "%032x" % rng.getrandbits(128)
 
 
-def build(con, tenants: dict[str, tuple[int, int, int]] = TENANTS) -> None:
-    con.execute("CREATE SCHEMA IF NOT EXISTS shared")
-    con.execute("CREATE OR REPLACE TABLE shared.states (state_code VARCHAR, state_name VARCHAR, region VARCHAR)")
-    con.executemany("INSERT INTO shared.states VALUES (?, ?, ?)", STATES)
+@dataclass
+class Table:
+    schema: str
+    name: str
+    columns: list[tuple[str, str]]  # (name, type): VARCHAR | INTEGER | TIMESTAMP | DECIMAL
+    rows: list[tuple] = field(default_factory=list)
+
+
+CUSTOMERS = [("customer_id", "VARCHAR"), ("customer_unique_id", "VARCHAR"), ("customer_city", "VARCHAR"), ("customer_state", "VARCHAR")]
+PRODUCTS = [("product_id", "VARCHAR"), ("product_category_name", "VARCHAR")]
+ITEMS = [("order_id", "VARCHAR"), ("order_item_id", "INTEGER"), ("product_id", "VARCHAR"), ("seller_id", "VARCHAR"),
+         ("shipping_limit_date", "TIMESTAMP"), ("price", "DECIMAL"), ("freight_value", "DECIMAL")]
+ORDERS = [("order_id", "VARCHAR"), ("customer_id", "VARCHAR"), ("order_status", "VARCHAR"), ("order_purchase_timestamp", "TIMESTAMP"),
+          ("order_delivered_customer_date", "TIMESTAMP"), ("order_estimated_delivery_date", "TIMESTAMP")]
+
+
+def generate(tenants: dict[str, tuple[int, int, int]] = TENANTS, prefix: str = "") -> list[Table]:
+    """The whole warehouse as tables of rows, deterministic for a given `tenants`.
+
+    `prefix` namespaces the schemas (e.g. per integration-test run): `<prefix>shared`, `<prefix>tenant_<t>`.
+    """
+    out = [Table(f"{prefix}shared", "states", [("state_code", "VARCHAR"), ("state_name", "VARCHAR"), ("region", "VARCHAR")], list(STATES))]
     for tenant, (n_customers, n_orders, seed) in tenants.items():
         rng = random.Random(seed)
-        s = f"tenant_{tenant}"
-        con.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
-        con.execute(f"CREATE OR REPLACE TABLE {s}.customers (customer_id VARCHAR, customer_unique_id VARCHAR, customer_city VARCHAR, customer_state VARCHAR)")
-        con.execute(f"CREATE OR REPLACE TABLE {s}.products (product_id VARCHAR, product_category_name VARCHAR)")
-        con.execute(f"CREATE OR REPLACE TABLE {s}.order_items (order_id VARCHAR, order_item_id INTEGER, product_id VARCHAR, seller_id VARCHAR, shipping_limit_date TIMESTAMP, price DECIMAL(10,2), freight_value DECIMAL(10,2))")
-        for y, m in MONTHS:
-            con.execute(
-                f"CREATE OR REPLACE TABLE {s}.orders_{y:04d}_{m:02d} (order_id VARCHAR, customer_id VARCHAR, order_status VARCHAR, "
-                "order_purchase_timestamp TIMESTAMP, order_delivered_customer_date TIMESTAMP, order_estimated_delivery_date TIMESTAMP)"
-            )
-
+        s = f"{prefix}tenant_{tenant}"
         uniques = [_uid(rng) for _ in range(int(n_customers * 0.9))]
         customers = []
         for _ in range(n_customers):
             st = rng.choice(BUSY_STATES)
             customers.append((_uid(rng), rng.choice(uniques), rng.choice(CITIES.get(st, [f"capital {st.lower()}"])), st))
-        con.executemany(f"INSERT INTO {s}.customers VALUES (?, ?, ?, ?)", customers)
         products = [(_uid(rng), rng.choice(CATEGORIES)) for _ in range(80)]
-        con.executemany(f"INSERT INTO {s}.products VALUES (?, ?)", products)
         sellers = [_uid(rng) for _ in range(25)]
-
         start, span = datetime(2017, 1, 1), (datetime(2018, 9, 1) - datetime(2017, 1, 1)).total_seconds()
-        by_month: dict[tuple[int, int], list[tuple]] = {}
+        by_month: dict[tuple[int, int], list[tuple]] = {m: [] for m in MONTHS}
         items = []
         for _ in range(n_orders):
             oid = _uid(rng)
@@ -76,14 +83,68 @@ def build(con, tenants: dict[str, tuple[int, int, int]] = TENANTS) -> None:
             status = rng.choice(STATUSES)
             est = ts + timedelta(days=rng.randint(10, 30))
             delivered = ts + timedelta(days=rng.randint(3, 40)) if status == "delivered" else None
-            by_month.setdefault((ts.year, ts.month), []).append((oid, rng.choice(customers)[0], status, ts, delivered, est))
+            by_month[(ts.year, ts.month)].append((oid, rng.choice(customers)[0], status, ts, delivered, est))
             for i in range(1, rng.choice([1, 1, 1, 2, 2, 3]) + 1):
-                price = round(rng.uniform(10, 400), 2)
+                price = Decimal(str(round(rng.uniform(10, 400), 2)))
                 items.append((oid, i, rng.choice(products)[0], rng.choice(sellers), ts + timedelta(days=rng.randint(1, 7)),
-                              price, round(price * rng.uniform(0.05, 0.25), 2)))
-        for (y, m), rows in by_month.items():
-            con.executemany(f"INSERT INTO {s}.orders_{y:04d}_{m:02d} VALUES (?, ?, ?, ?, ?, ?)", rows)
-        con.executemany(f"INSERT INTO {s}.order_items VALUES (?, ?, ?, ?, ?, ?, ?)", items)
+                              price, (price * Decimal(str(round(rng.uniform(0.05, 0.25), 4)))).quantize(Decimal("0.01"))))
+        out += [Table(s, "customers", CUSTOMERS, customers), Table(s, "products", PRODUCTS, products),
+                Table(s, "order_items", ITEMS, items)]
+        out += [Table(s, f"orders_{y:04d}_{m:02d}", ORDERS, rows) for (y, m), rows in by_month.items()]
+    return out
+
+
+def _sql_type(t: str, dialect: str) -> str:
+    if t == "DECIMAL":
+        return "NUMERIC" if dialect == "bigquery" else "DECIMAL(10,2)"
+    if dialect == "bigquery":
+        return {"VARCHAR": "STRING", "INTEGER": "INT64"}.get(t, t)
+    return t
+
+
+def build(con, tenants: dict[str, tuple[int, int, int]] = TENANTS, prefix: str = "") -> None:
+    """Load into DuckDB (a duckdb connection) or Postgres (a psycopg connection)."""
+    pg = type(con).__module__.startswith("psycopg")
+    ph = "%s" if pg else "?"
+    schemas = set()
+    for t in generate(tenants, prefix):
+        if t.schema not in schemas:
+            con.execute(f"DROP SCHEMA IF EXISTS {t.schema} CASCADE" if pg else f"CREATE SCHEMA IF NOT EXISTS {t.schema}")
+            if pg:
+                con.execute(f"CREATE SCHEMA {t.schema}")
+            schemas.add(t.schema)
+        cols = ", ".join(f"{c} {_sql_type(ty, 'postgres' if pg else 'duckdb')}" for c, ty in t.columns)
+        con.execute(f"CREATE OR REPLACE TABLE {t.schema}.{t.name} ({cols})" if not pg else f"CREATE TABLE {t.schema}.{t.name} ({cols})")
+        if t.rows:
+            sql = f"INSERT INTO {t.schema}.{t.name} VALUES ({', '.join([ph] * len(t.columns))})"
+            if pg:
+                with con.cursor() as cur:
+                    cur.executemany(sql, t.rows)
+            else:
+                con.executemany(sql, t.rows)
+
+
+def build_bigquery(client, tenants: dict[str, tuple[int, int, int]] = TENANTS, prefix: str = "", location: str = "US") -> list[str]:
+    """Load into BigQuery datasets `<prefix>shared` / `<prefix>tenant_<t>` with load jobs (free). Returns dataset ids."""
+    from google.cloud import bigquery
+
+    tables = generate(tenants, prefix)
+    datasets = sorted({t.schema for t in tables})
+    for ds in datasets:
+        d = bigquery.Dataset(f"{client.project}.{ds}")
+        d.location = location
+        d.default_table_expiration_ms = 24 * 3600 * 1000  # safety net if cleanup is skipped
+        client.create_dataset(d, exists_ok=True)
+    jobs = []
+    for t in tables:
+        schema = [bigquery.SchemaField(c, _sql_type(ty, "bigquery")) for c, ty in t.columns]
+        rows = [{c: (v.isoformat() if isinstance(v, datetime) else str(v) if isinstance(v, Decimal) else v)
+                 for (c, _), v in zip(t.columns, r)} for r in t.rows]
+        cfg = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
+        jobs.append(client.load_table_from_json(rows, f"{client.project}.{t.schema}.{t.name}", job_config=cfg, location=location))
+    for j in jobs:
+        j.result(timeout=300)
+    return datasets
 
 
 _PACKAGED = Path(__file__).resolve().parent / "examples" / "olist" / "migrations"  # installed wheel

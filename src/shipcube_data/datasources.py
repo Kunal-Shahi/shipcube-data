@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .catalog import Catalog, _loads, _now
 from .compiler import DIALECTS
 from .model import ModelError
+from .warehouses import BigQueryWarehouse, DuckDBWarehouse, Executor, PostgresWarehouse
 
 _RESOURCE_RE = re.compile(r"^projects/[^/]+/secrets/[A-Za-z0-9_-]+$")
 _SECRETISH = re.compile(r"(password|passwd|secret|token|key|credential)", re.I)
@@ -40,7 +41,6 @@ class Datasource(BaseModel):
 
 
 SecretResolver = Callable[[SecretRef], str]
-Executor = Callable[[str], tuple[list[str], list[tuple]]]
 Connector = Callable[[Datasource, Optional[str]], Executor]
 
 
@@ -48,8 +48,10 @@ def register_datasource(catalog: Catalog, ds: Datasource, actor: Optional[str] =
     """Validate and store a datasource. The catalog's dialect follows the datasource's kind."""
     if ds.kind not in DIALECTS:
         raise ModelError(f"unsupported warehouse kind {ds.kind!r}; pick one of {', '.join(DIALECTS)}", "invalid")
-    if ds.kind != "duckdb" and ds.secret_ref is None:
+    if ds.kind in {"postgres", "clickhouse"} and ds.secret_ref is None:
         raise ModelError(f"a {ds.kind} datasource needs a secret_ref", "invalid")
+    if ds.kind == "bigquery" and not ds.options.get("project"):
+        raise ModelError("a bigquery datasource needs options.project", "invalid")
     if ds.secret_ref and not _RESOURCE_RE.match(ds.secret_ref.resource_name):
         raise ModelError("secret_ref.resource_name must look like projects/<p>/secrets/<name>", "invalid")
     bad = [k for k in ds.options if _SECRETISH.search(k)]
@@ -86,17 +88,35 @@ def get_datasource(catalog: Catalog, name: str = "primary") -> Datasource:
 def duckdb_connector(ds: Datasource, secret: Optional[str]) -> Executor:
     import duckdb
 
-    from .engine import duckdb_executor
-
-    return duckdb_executor(duckdb.connect(ds.options.get("path", ":memory:"), read_only=bool(ds.options.get("path"))))
+    return DuckDBWarehouse(duckdb.connect(ds.options.get("path", ":memory:"), read_only=bool(ds.options.get("path"))))
 
 
-DEFAULT_CONNECTORS: dict[str, Connector] = {"duckdb": duckdb_connector}
+def postgres_connector(ds: Datasource, secret: Optional[str]) -> Executor:
+    """Cloud SQL Postgres. The secret is a full libpq URL, or just the password for options
+    host / port / dbname / user / sslmode (host may be /cloudsql/<project>:<region>:<instance>)."""
+    if secret and secret.startswith(("postgres://", "postgresql://")):
+        return PostgresWarehouse(secret)
+    from psycopg.conninfo import make_conninfo
+
+    o = ds.options
+    conninfo = make_conninfo(host=o.get("host"), port=o.get("port"), dbname=o.get("dbname"), user=o.get("user"),
+                             password=secret, sslmode=o.get("sslmode", "prefer"))
+    return PostgresWarehouse(conninfo)
+
+
+def bigquery_connector(ds: Datasource, secret: Optional[str]) -> Executor:
+    """BigQuery. Without a secret the runtime service account (ADC / workload identity) is used."""
+    return BigQueryWarehouse(project=ds.options["project"], location=ds.options.get("location"), credentials_json=secret)
+
+
+DEFAULT_CONNECTORS: dict[str, Connector] = {
+    "duckdb": duckdb_connector, "postgres": postgres_connector, "bigquery": bigquery_connector,
+}
 
 
 def open_executor(catalog: Catalog, resolve_secret: Optional[SecretResolver] = None, name: str = "primary",
                   connectors: Optional[dict[str, Connector]] = None) -> Executor:
-    """Connect to a registered datasource. Postgres/BigQuery/ClickHouse connectors are passed in by the API."""
+    """Connect to a registered datasource. Built-in connectors: duckdb, postgres, bigquery."""
     ds = get_datasource(catalog, name)
     connector = {**DEFAULT_CONNECTORS, **(connectors or {})}.get(ds.kind)
     if connector is None:
