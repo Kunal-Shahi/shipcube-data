@@ -1,0 +1,52 @@
+{
+  "description": "Olist-shaped base cubes",
+  "ops": [
+    {"op": "create_cube", "name": "customers", "table": "customers",
+     "dimensions": {
+       "customer_id": {"sql": "customer_id", "primary_key": true},
+       "city": "customer_city",
+       "state": "customer_state"
+     },
+     "measures": {"unique_customers": "customer_unique_id"}},
+
+    {"op": "create_cube", "name": "states", "table": "states",
+     "description": "Brazilian states with their macro-region",
+     "dimensions": {"code": "state_code", "name": "state_name", "region": "region"}},
+    {"op": "bind_schema", "cube": "states", "schema": "shared"},
+
+    {"op": "create_cube", "name": "orders", "table": "orders",
+     "dimensions": {
+       "order_id": {"sql": "order_id", "primary_key": true},
+       "status": "order_status",
+       "purchased_at": "order_purchase_timestamp",
+       "delivered_at": "order_delivered_customer_date",
+       "estimated_delivery_at": "order_estimated_delivery_date",
+       "is_late": "order_delivered_customer_date > order_estimated_delivery_date"
+     },
+     "measures": {
+       "unique_orders": "order_id",
+       "delivered_count": {"agg": "count", "filter": "order_status = 'delivered'"},
+       "late_count": {"agg": "count", "filter": "{is_late}"}
+     }},
+    {"op": "add_measure", "name": "orders.late_rate", "sql": "1.0 * {late_count} / NULLIF({delivered_count}, 0)",
+     "description": "Share of delivered orders that arrived after the estimated date", "format": "percent"},
+    {"op": "add_segment", "name": "orders.delivered", "sql": "order_status = 'delivered'"},
+
+    {"op": "create_cube", "name": "products", "table": "products",
+     "dimensions": {"product_id": {"sql": "product_id", "primary_key": true}, "category": "product_category_name"}},
+
+    {"op": "create_cube", "name": "order_items", "table": "order_items",
+     "dimensions": {
+       "order_id": "order_id",
+       "seller_id": "seller_id",
+       "shipping_limit_at": "shipping_limit_date"
+     },
+     "measures": {
+       "revenue": {"sql": "price", "format": "currency", "description": "Item price, excluding freight"},
+       "freight": "freight_value",
+       "avg_price": "price",
+       "max_price": "price"
+     }},
+    {"op": "add_measure", "name": "order_items.gmv", "sql": "{revenue} + {freight}", "format": "currency"}
+  ]
+}

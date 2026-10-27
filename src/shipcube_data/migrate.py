@@ -1,0 +1,250 @@
+"""Migration runner: status, dry-run with impact analysis, apply, rollback, propose/approve."""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Optional
+
+from .catalog import Catalog, _entities
+from .compiler import Compiler, SecurityContext
+from .model import Model, ModelError
+from .ops import Migration, apply_ops, conflicts
+from .query import Query
+
+
+class MigrationError(ModelError):
+    pass
+
+
+def load_dir(path: str | Path) -> list[Migration]:
+    out = []
+    for f in sorted(Path(path).glob("*.json")):
+        data = json.loads(f.read_text())
+        data.setdefault("id", f.stem)
+        if data["id"] != f.stem:
+            raise MigrationError(f"{f.name}: id {data['id']!r} must match the file name")
+        out.append(Migration.model_validate(data))
+    return out
+
+
+def diff_models(old: Model, new: Model) -> dict[str, list[str]]:
+    before, after = _entities(old), _entities(new)
+    label = lambda k: f"{k[0]}:{'.'.join(k[1])}"  # noqa: E731
+    return {
+        "added": sorted(label(k) for k in after.keys() - before.keys()),
+        "changed": sorted(label(k) for k in after.keys() & before.keys() if after[k] != before[k]),
+        "removed": sorted(label(k) for k in before.keys() - after.keys()),
+    }
+
+
+class Runner:
+    def __init__(self, catalog: Catalog):
+        self.catalog = catalog
+
+    # ------------------------------------------------------------ status
+
+    def status(self, files: list[Migration]) -> list[dict[str, Any]]:
+        rows = []
+        known = {m["id"]: m for m in self.catalog.migrations()}
+        for m in files:
+            rec = known.pop(m.id, None)
+            if rec is None:
+                state = "pending"
+            elif rec["status"] == "applied" and rec["checksum"] != m.checksum():
+                state = "modified"  # edited after apply: an error
+            else:
+                state = rec["status"] if rec["status"] != "approved" else "approved"
+            rows.append({"id": m.id, "state": state, "version": rec["version"] if rec else None, "kind": m.kind()})
+        for rec in known.values():
+            rows.append({"id": rec["id"], "state": rec["status"] if rec["status"] != "applied" else "applied (no file)",
+                         "version": rec["version"], "kind": rec["kind"]})
+        return sorted(rows, key=lambda r: r["id"])
+
+    # ------------------------------------------------------------ planning
+
+    def _base(self, m: Migration) -> int:
+        if m.base_version is not None:
+            return m.base_version
+        applied = [r for r in self.catalog.migrations("applied")]
+        later = [r for r in applied if r["id"] > m.id]
+        if not later:
+            return self.catalog.head()
+        earlier = [r["version"] for r in applied if r["id"] < m.id]
+        return max(earlier, default=0)
+
+    def plan(self, m: Migration, *, saved: bool = True) -> dict[str, Any]:
+        """Everything apply would do, without writing. Raises on invalid ops or conflicts."""
+        prior = self.catalog.migration(m.id)
+        if prior and prior["status"] == "applied":
+            if prior["checksum"] != m.checksum():
+                raise MigrationError(f"{m.id} was edited after it was applied (checksum changed); write a new migration instead")
+            return {"id": m.id, "status": "already_applied", "version": prior["version"]}
+        old = self.catalog.load()
+        new, touched = apply_ops(old, m.ops, self.catalog.dialect)
+        base = self._base(m)
+        clashes = []
+        for rec in self.catalog.applied_since(base):
+            overlap = conflicts(touched, set(json.loads(rec["touches"])))
+            if overlap:
+                clashes.append({"migration": rec["id"], "version": rec["version"], "touches": sorted(overlap)})
+        if clashes:
+            detail = "; ".join(f"{c['migration']} also changed {', '.join(c['touches'])}" for c in clashes)
+            raise MigrationError(f"{m.id} conflicts with migrations applied after version {base}: {detail}. Rebase it on version {self.catalog.head()}")
+        report = {
+            "id": m.id,
+            "status": "planned",
+            "kind": m.kind(),
+            "base_version": base,
+            "head_version": self.catalog.head(),
+            "rebased": base != self.catalog.head(),
+            "touches": sorted(touched),
+            "diff": diff_models(old, new),
+            "fingerprint": {"before": old.fingerprint(), "after": new.fingerprint()},
+        }
+        if saved:
+            report["impact"] = self.impact(old, new)
+        return report | {"_new": new, "_touched": touched, "_old": old}
+
+    def impact(self, old: Model, new: Model) -> dict[str, Any]:
+        """Compile every saved query against both models and report what breaks or changes."""
+        breaks, changes, warnings = [], [], []
+        unaffected = 0
+        dialect = self.catalog.dialect
+        for sq in self.catalog.saved_queries():
+            ctx = SecurityContext(tenant=sq["tenant"] or "impact_check", roles=sq["roles"])
+            try:
+                q = Query.model_validate(sq["query"])
+                before = Compiler(old, ctx, dialect, dialect).compile(q)
+            except ModelError:
+                continue  # already broken before this migration; not our impact
+            try:
+                after_c = Compiler(new, ctx, dialect, dialect)
+                after = after_c.compile(q)
+            except ModelError as e:
+                breaks.append({"query": sq["name"], "app": sq["app"], "error": str(e)})
+                continue
+            new_warn = [w for w in after.warnings if w not in before.warnings]
+            if after.sql != before.sql:
+                changes.append({"query": sq["name"], "app": sq["app"], "note": "same query, different SQL: results may change"})
+            elif new_warn:
+                warnings.append({"query": sq["name"], "app": sq["app"], "warnings": new_warn})
+            else:
+                unaffected += 1
+        apps = sorted({x["app"] for x in breaks if x["app"]})
+        return {"breaks": breaks, "changes": changes, "warnings": warnings, "unaffected": unaffected, "apps_broken": apps}
+
+    @staticmethod
+    def _public(report: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in report.items() if not k.startswith("_")}
+
+    def dry_run(self, m: Migration, actor: Optional[str] = None) -> dict[str, Any]:
+        report = self._public(self.plan(m))
+        self.catalog.audit("dry_run", actor, m.id, kind=report.get("kind"), diff=report.get("diff"))
+        return report | {"status": "dry_run" if report["status"] == "planned" else report["status"]}
+
+    # ------------------------------------------------------------ apply / rollback
+
+    def apply(self, m: Migration, actor: Optional[str] = None, *, require_approval: bool = False,
+              allow_breaking: bool = True) -> dict[str, Any]:
+        prior = self.catalog.migration(m.id)
+        if require_approval and (not prior or prior["status"] != "approved"):
+            raise MigrationError(f"{m.id} needs human approval before it can be applied")
+        report = self.plan(m)
+        if report["status"] == "already_applied":
+            return report
+        if not allow_breaking and report["impact"]["breaks"]:
+            names = ", ".join(b["query"] for b in report["impact"]["breaks"])
+            raise MigrationError(f"{m.id} would break saved queries: {names}")
+        with self.catalog.transaction() as cat:
+            version, diff = cat.commit_version(m.id, report["_old"], report["_new"], actor)
+            cat.upsert_migration(
+                id=m.id, description=m.description, checksum=m.checksum(),
+                ops=json.dumps([op.model_dump(mode="json", by_alias=True, exclude_defaults=True) for op in m.ops]),
+                touches=json.dumps(sorted(report["_touched"])), kind=m.kind(), status="applied",
+                base_version=report["base_version"], version=version,
+                impact=json.dumps(report.get("impact")), applied_at=_now(),
+            )
+            cat.audit("apply", actor, m.id, version, diff=diff)
+        return self._public(report) | {"status": "applied", "version": version}
+
+    def apply_all(self, files: list[Migration], actor: Optional[str] = None) -> list[dict[str, Any]]:
+        """Apply every file that is not already applied, rolled back or rejected, in id order."""
+        status = {r["id"]: r["status"] for r in self.catalog.migrations()}
+        done = {mid for mid, st in status.items() if st in {"applied", "rolled_back", "rejected"}}
+        for m in files:
+            if status.get(m.id) == "applied":
+                self.plan(m, saved=False)  # raises if the file was edited after apply
+        return [self.apply(m, actor) for m in files if m.id not in done]
+
+    def rollback(self, actor: Optional[str] = None, *, dry_run: bool = False) -> dict[str, Any]:
+        head = self.catalog.head()
+        if head == 0:
+            raise MigrationError("nothing to roll back")
+        rec = next(r for r in self.catalog.migrations("applied") if r["version"] == head)
+        old, new = self.catalog.load(head), self.catalog.load(self._previous(head))
+        report = {"id": rec["id"], "version": head, "to_version": self._previous(head),
+                  "diff": diff_models(old, new), "impact": self.impact(old, new)}
+        if dry_run:
+            return report | {"status": "dry_run"}
+        with self.catalog.transaction() as cat:
+            cat.pop_version(head)
+            cat.upsert_migration(id=rec["id"], status="rolled_back")
+            cat.audit("rollback", actor, rec["id"], head)
+        return report | {"status": "rolled_back"}
+
+    def _previous(self, version: int) -> int:
+        live = [v["version"] for v in self.catalog.versions() if v["version"] < version and not v["rolled_back_at"]]
+        return max(live, default=0)
+
+    # ------------------------------------------------------------ agent proposals
+
+    def propose(self, ops: list[dict[str, Any]], description: str, proposed_by: str,
+                migration_id: Optional[str] = None) -> dict[str, Any]:
+        """Validate, dry-run and store a migration for a human to approve. Never applies it."""
+        mid = migration_id or self._next_id(description)
+        m = Migration.model_validate({"id": mid, "description": description, "base_version": self.catalog.head(), "ops": ops})
+        report = self._public(self.plan(m))
+        with self.catalog.transaction() as cat:
+            cat.upsert_migration(
+                id=m.id, description=description, checksum=m.checksum(),
+                ops=json.dumps([op.model_dump(mode="json", by_alias=True, exclude_defaults=True) for op in m.ops]),
+                touches=json.dumps(report["touches"]), kind=m.kind(), status="proposed",
+                base_version=m.base_version, proposed_by=proposed_by, impact=json.dumps(report["impact"]),
+            )
+            cat.audit("propose", proposed_by, m.id, kind=m.kind())
+        return report | {"status": "proposed", "migration": m.model_dump(mode="json", by_alias=True, exclude_defaults=True)}
+
+    def approve(self, mid: str, approver: str) -> None:
+        rec = self.catalog.migration(mid)
+        if not rec or rec["status"] != "proposed":
+            raise MigrationError(f"{mid} is not a pending proposal")
+        if approver == rec["proposed_by"]:
+            raise MigrationError("a proposal must be approved by someone other than its proposer")
+        with self.catalog.transaction() as cat:
+            cat.upsert_migration(id=mid, status="approved", approved_by=approver)
+            cat.audit("approve", approver, mid)
+
+    def reject(self, mid: str, approver: str, reason: str = "") -> None:
+        with self.catalog.transaction() as cat:
+            cat.upsert_migration(id=mid, status="rejected", approved_by=approver)
+            cat.audit("reject", approver, mid, reason=reason)
+
+    def stored(self, mid: str) -> Migration:
+        rec = self.catalog.migration(mid)
+        if not rec:
+            raise MigrationError(f"unknown migration {mid}")
+        return Migration.model_validate({"id": rec["id"], "description": rec["description"],
+                                         "base_version": rec["base_version"], "ops": json.loads(rec["ops"])})
+
+    def _next_id(self, description: str) -> str:
+        nums = [int(r["id"].split("_")[0]) for r in self.catalog.migrations() if r["id"][:4].isdigit()]
+        slug = re.sub(r"[^a-z0-9]+", "_", description.lower()).strip("_")[:40] or "change"
+        return f"{max(nums, default=0) + 1:04d}_{slug}"
+
+
+def _now() -> str:
+    from .catalog import _now as now
+
+    return now()

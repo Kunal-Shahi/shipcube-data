@@ -1,0 +1,6 @@
+{
+  "description": "Every cube reads from its tenant's schema; reference data lives in shared",
+  "ops": [
+    {"op": "bind_schema", "schema": "tenant_{tenant}"}
+  ]
+}
