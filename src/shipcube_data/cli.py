@@ -7,6 +7,11 @@
   shipcube-data rollback --catalog catalog.db [--dry-run]
   shipcube-data query    --catalog catalog.db --warehouse demo.duckdb --tenant acme '{"measures": ["orders.count"]}'
   shipcube-data sql      --catalog catalog.db --tenant acme --dialect bigquery '{...}'
+  shipcube-data catalog-migrate --catalog postgresql://... --workspace <uuid>
+
+`--catalog` is a SQLite path or a postgresql:// URL (default: $SHIPCUBE_DATA_CATALOG_URL, else catalog.db).
+`--workspace` selects the workspace's catalog schema on Postgres (default: $SHIPCUBE_DATA_WORKSPACE_ID).
+Logs are JSON lines on stderr; command output is on stdout.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from .catalog import Catalog
 from .compiler import SecurityContext
 from .migrate import Runner, load_dir
 from .model import ModelError
+from .obs import configure_logging
 
 
 def _no_warehouse(sql, limits, query_id):
@@ -34,9 +40,10 @@ def _print(obj: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="shipcube-data")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("status", "dry-run", "apply", "rollback", "query", "sql", "demo"):
+    for name in ("status", "dry-run", "apply", "rollback", "query", "sql", "demo", "catalog-migrate"):
         s = sub.add_parser(name)
-        s.add_argument("--catalog", default="catalog.db")
+        s.add_argument("--catalog", default=os.environ.get("SHIPCUBE_DATA_CATALOG_URL", "catalog.db"))
+        s.add_argument("--workspace", default=os.environ.get("SHIPCUBE_DATA_WORKSPACE_ID"))
         s.add_argument("--dir", default="examples/olist/migrations")
         s.add_argument("--warehouse", default="demo.duckdb")
         s.add_argument("--tenant", default="acme")
@@ -47,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--actor", default=os.environ.get("USER"))
         s.add_argument("arg", nargs="?")
     a = p.parse_args(argv)
+    configure_logging(os.environ.get("SHIPCUBE_DATA_LOG_LEVEL", "WARNING"), stream=sys.stderr)
 
     try:
         if a.cmd == "demo":
@@ -59,7 +67,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"built {a.warehouse}: schemas shared, tenant_acme, tenant_globex")
             return 0
 
-        cat = Catalog(a.catalog)
+        if a.cmd == "catalog-migrate":
+            from .db import Db, workspace_schema
+
+            db = Db(a.catalog, schema=workspace_schema(a.workspace))
+            applied = db.migrate_schema()
+            print(f"catalog schema {db.schema or a.catalog}: applied {applied or 'nothing (up to date)'}")
+            return 0
+        cat = Catalog(a.catalog, workspace_id=a.workspace)
         runner = Runner(cat)
         if a.cmd == "status":
             for row in runner.status(load_dir(a.dir)):

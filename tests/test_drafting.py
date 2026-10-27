@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from shipcube_data.drafting import MockMuse, MuseDrafter, RuleDrafter
+from shipcube_data.drafting import MuseDrafter, RuleDrafter
+from shipcube_data.testing import MockMuse
 from shipcube_data.model import ModelError
 
 from .test_tools import WS, agent, tools  # noqa: F401  (fixture)
@@ -51,7 +52,7 @@ def test_muse_draft_is_used_when_valid(runner):
     reply = 'Sure! {"description": "Track buyers", "ops": [{"op": "add_measure", "name": "orders.buyers", "sql": "customer_id", "agg": "count_distinct"}]}'
     muse = MockMuse(reply)
     d = MuseDrafter(muse).draft(runner.catalog.load(), "duckdb", "track how many distinct people buy", "")
-    assert d.explained_by == "muse-spark" and d.description == "Track buyers"
+    assert d.explained_by == "muse-spark" and d.description == "Track buyers"  # MockMuse has no .model
     system, user = muse.calls[0]
     assert "add_measure" in system and "orders (table orders" in user  # model summary grounds the draft
 

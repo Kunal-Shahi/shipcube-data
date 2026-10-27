@@ -17,6 +17,7 @@ import sqlglot
 from sqlglot import exp
 
 from .model import Model, ModelError
+from .obs import log_event
 from .ops import OP_ADAPTER, OP_NAMES, infer_agg
 
 # (system prompt, user prompt) -> model text. ShipCube implements this over its AI gateway.
@@ -196,8 +197,15 @@ def _first_json_object(text: str) -> dict[str, Any]:
 class MuseDrafter:
     """Muse Spark drafts; RuleDrafter is the deterministic fallback when Muse is missing or wrong."""
 
-    def __init__(self, muse: Optional[MuseClient], fallback: Optional[DraftProvider] = None):
+    def __init__(self, muse: Optional[MuseClient] = None, fallback: Optional[DraftProvider] = None):
         self.muse, self.fallback = muse, fallback or RuleDrafter()
+
+    @classmethod
+    def from_env(cls) -> "MuseDrafter":
+        """Real Muse Spark when META_API_KEY is set, rules otherwise."""
+        from .muse import muse_from_env
+
+        return cls(muse_from_env())
 
     def draft(self, model: Model, dialect: str, request: str, code: str) -> Draft:
         reason = "Muse Spark is not configured"
@@ -210,21 +218,14 @@ class MuseDrafter:
                     raise ValueError("reply has no ops")
                 for op in ops:
                     OP_ADAPTER.validate_python(op)
+                log_event("draft.muse_ok", ops=len(ops))
                 return Draft(ops=ops, description=str(reply.get("description") or request or "Drafted by Muse Spark")[:200],
-                             explained_by="muse-spark")
-            except Exception as e:  # any Muse failure falls back to rules; the error is reported, not raised
+                             explained_by=getattr(self.muse, "model", "muse-spark"))
+            except Exception as e:  # any Muse failure falls back to rules; logged and reported, never silent
                 reason = f"Muse Spark draft unusable ({type(e).__name__}: {str(e)[:120]})"
+                log_event("draft.muse_fallback", level=30, error=type(e).__name__, detail=str(e)[:200])
+        else:
+            log_event("draft.rules_only", reason="META_API_KEY not set")
         draft = self.fallback.draft(model, dialect, request, code)
         draft.notes.insert(0, f"{reason}; drafted with rules instead")
         return draft
-
-
-class MockMuse:
-    """Stand-in for Muse Spark in tests and demos: returns canned replies and records prompts."""
-
-    def __init__(self, reply: str | Callable[[str, str], str]):
-        self.reply, self.calls = reply, []
-
-    def __call__(self, system: str, user: str) -> str:
-        self.calls.append((system, user))
-        return self.reply(system, user) if callable(self.reply) else self.reply

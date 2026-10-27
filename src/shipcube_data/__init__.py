@@ -8,7 +8,7 @@ Entry points for ShipCube's MCP server and API:
 from .catalog import Catalog
 from .compiler import SecurityContext
 from .datasources import Datasource, SecretRef, register_datasource
-from .drafting import MockMuse, MuseDrafter, RuleDrafter
+from .drafting import MuseDrafter, RuleDrafter
 from .engine import DataLayer
 from .identity import Caller, security_context
 from .migrate import Runner
@@ -17,6 +17,6 @@ from .tools import DataTools, ToolError
 
 __version__ = "0.1.0"
 __all__ = [
-    "Caller", "Catalog", "DataLayer", "DataTools", "Datasource", "MockMuse", "ModelError", "MuseDrafter",
+    "Caller", "Catalog", "DataLayer", "DataTools", "Datasource", "ModelError", "MuseDrafter",
     "RuleDrafter", "Runner", "SecretRef", "SecurityContext", "ToolError", "register_datasource", "security_context",
 ]

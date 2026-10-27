@@ -113,6 +113,12 @@ class Catalog:
         self.db = Db(self.url, schema=workspace_schema(str(workspace_id) if workspace_id else None))
         if migrate:
             self.db.migrate_schema()
+        else:
+            pending = self.db.pending_schema_migrations()
+            if pending:
+                self.db.close()
+                raise ModelError(f"catalog schema is behind ({', '.join(pending)} pending); run `shipcube-data catalog-migrate`",
+                                 "catalog_not_migrated")
         self.db.execute("INSERT INTO settings (key, value) VALUES ('dialect', ?) ON CONFLICT (key) DO NOTHING", (dialect,))
         if workspace_id:
             self.db.execute("INSERT INTO settings (key, value) VALUES ('workspace_id', ?) ON CONFLICT (key) DO NOTHING", (str(workspace_id),))

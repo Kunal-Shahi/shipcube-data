@@ -27,7 +27,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .datasources import Datasource, SecretRef, register_datasource
-from .drafting import DraftProvider, RuleDrafter
+from .drafting import DraftProvider, MuseDrafter
 from .engine import DataLayer
 from .identity import Caller, security_context
 from .model import ModelError
@@ -139,7 +139,7 @@ class DataTools:
                  approval_url: Callable[[UUID, str], str] = default_approval_url,
                  drafter: Optional[DraftProvider] = None):
         self.layer_for, self.approval_url = layer_for, approval_url
-        self.drafter = drafter or RuleDrafter()
+        self.drafter = drafter or MuseDrafter.from_env()
 
     # ------------------------------------------------------------ registry
 

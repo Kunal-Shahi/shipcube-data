@@ -224,3 +224,19 @@ def test_mcp_schemas_generate():
     op_schema = OP_ADAPTER.json_schema()
     assert set(op_schema["discriminator"]["mapping"]) == set(OP_NAMES) and len(OP_NAMES) == 18
     assert "measures" in Query.model_json_schema()["properties"]
+
+
+def test_catalog_schema_migrations_are_versioned(tmp_path):
+    from shipcube_data.db import Db
+
+    url = str(tmp_path / "c.db")
+    with pytest.raises(ModelError) as e:
+        Catalog(url, migrate=False)
+    assert e.value.code == "catalog_not_migrated"
+    assert Db(url).migrate_schema() == ["0001_initial.sql"]
+    assert Db(url).migrate_schema() == []  # idempotent
+    cat = Catalog(url, migrate=False)
+    assert cat.db.execute("SELECT version, name FROM catalog_schema_migrations").fetchall() == [{"version": 1, "name": "0001_initial.sql"}]
+    cat.db.execute("UPDATE catalog_schema_migrations SET checksum = 'edited'")
+    with pytest.raises(ModelError, match="changed after it was applied"):
+        Db(url).migrate_schema()

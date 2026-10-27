@@ -146,16 +146,27 @@ class Db:
 
     # ------------------------------------------------------------ schema migrations
 
+    def _schema_files(self) -> list:
+        return sorted(
+            (f for f in resources.files("shipcube_data.catalog_migrations").joinpath(self.kind).iterdir() if f.name.endswith(".sql")),
+            key=lambda f: f.name,
+        )
+
+    def pending_schema_migrations(self) -> list[str]:
+        if self.kind == "postgres":
+            exists = self.execute("SELECT to_regclass('catalog_schema_migrations') IS NOT NULL AS ok").fetchone()["ok"]
+        else:
+            exists = bool(self.execute("SELECT 1 FROM sqlite_master WHERE name = 'catalog_schema_migrations'").fetchone())
+        done = {r["version"] for r in self.execute("SELECT version FROM catalog_schema_migrations")} if exists else set()
+        return [f.name for f in self._schema_files() if int(f.name.split("_", 1)[0]) not in done]
+
     def migrate_schema(self) -> list[str]:
         """Apply pending catalog-schema migrations for this backend, in order, under a lock.
 
         Applied files are checksummed; editing one after it ran is refused.
         """
         applied: list[str] = []
-        files = sorted(
-            (f for f in resources.files("shipcube_data.catalog_migrations").joinpath(self.kind).iterdir() if f.name.endswith(".sql")),
-            key=lambda f: f.name,
-        )
+        files = self._schema_files()
         with self._session_lock():
             self.script(
                 "CREATE TABLE IF NOT EXISTS catalog_schema_migrations ("
