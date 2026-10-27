@@ -15,7 +15,8 @@ from .query import Query
 
 
 class MigrationError(ModelError):
-    pass
+    def __init__(self, message: str, code: str = "invalid_migration", hint: str | None = None):
+        super().__init__(message, code, hint)
 
 
 def load_dir(path: str | Path) -> list[Migration]:
@@ -79,7 +80,7 @@ class Runner:
         prior = self.catalog.migration(m.id)
         if prior and prior["status"] == "applied":
             if prior["checksum"] != m.checksum():
-                raise MigrationError(f"{m.id} was edited after it was applied (checksum changed); write a new migration instead")
+                raise MigrationError(f"{m.id} was edited after it was applied (checksum changed); write a new migration instead", "checksum_mismatch")
             return {"id": m.id, "status": "already_applied", "version": prior["version"]}
         old = self.catalog.load()
         new, touched = apply_ops(old, m.ops, self.catalog.dialect)
@@ -91,7 +92,7 @@ class Runner:
                 clashes.append({"migration": rec["id"], "version": rec["version"], "touches": sorted(overlap)})
         if clashes:
             detail = "; ".join(f"{c['migration']} also changed {', '.join(c['touches'])}" for c in clashes)
-            raise MigrationError(f"{m.id} conflicts with migrations applied after version {base}: {detail}. Rebase it on version {self.catalog.head()}")
+            raise MigrationError(f"{m.id} conflicts with migrations applied after version {base}: {detail}. Rebase it on version {self.catalog.head()}", "conflict")
         report = {
             "id": m.id,
             "status": "planned",
@@ -150,13 +151,13 @@ class Runner:
               allow_breaking: bool = True) -> dict[str, Any]:
         prior = self.catalog.migration(m.id)
         if require_approval and (not prior or prior["status"] != "approved"):
-            raise MigrationError(f"{m.id} needs human approval before it can be applied")
+            raise MigrationError(f"{m.id} needs human approval before it can be applied", "needs_approval")
         report = self.plan(m)
         if report["status"] == "already_applied":
             return report
         if not allow_breaking and report["impact"]["breaks"]:
             names = ", ".join(b["query"] for b in report["impact"]["breaks"])
-            raise MigrationError(f"{m.id} would break saved queries: {names}")
+            raise MigrationError(f"{m.id} would break saved queries: {names}", "would_break")
         with self.catalog.transaction() as cat:
             version, diff = cat.commit_version(m.id, report["_old"], report["_new"], actor)
             cat.upsert_migration(
@@ -221,7 +222,7 @@ class Runner:
         if not rec or rec["status"] != "proposed":
             raise MigrationError(f"{mid} is not a pending proposal")
         if approver == rec["proposed_by"]:
-            raise MigrationError("a proposal must be approved by someone other than its proposer")
+            raise MigrationError("a proposal must be approved by someone other than its proposer", "forbidden")
         with self.catalog.transaction() as cat:
             cat.upsert_migration(id=mid, status="approved", approved_by=approver)
             cat.audit("approve", approver, mid)
@@ -234,7 +235,7 @@ class Runner:
     def stored(self, mid: str) -> Migration:
         rec = self.catalog.migration(mid)
         if not rec:
-            raise MigrationError(f"unknown migration {mid}")
+            raise MigrationError(f"unknown migration {mid}", "not_found")
         return Migration.model_validate({"id": rec["id"], "description": rec["description"],
                                          "base_version": rec["base_version"], "ops": json.loads(rec["ops"])})
 

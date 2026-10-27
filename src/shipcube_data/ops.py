@@ -697,7 +697,7 @@ def apply_ops(model: Model, ops: list[Op], dialect: str) -> tuple[Model, set[str
         try:
             op.apply(new, dialect)
         except ModelError as e:
-            raise ModelError(f"op {i + 1} ({op.op}): {e}") from None
+            raise ModelError(f"op {i + 1} ({op.op}): {e}", "invalid_op", e.hint) from None
     return new, touched
 
 

@@ -92,7 +92,7 @@ def table_name(pattern: str, start: Optional[date] = None, value: Optional[str] 
 
 def prune(spec: PartitionSpec, column: exp.Expression, bounds: Bounds, cube: str) -> Pruned:
     if spec.require_filter and not bounds.bounded:
-        raise ModelError(f"{cube} is partitioned by {spec.column}; filter on it (require_filter is set)")
+        raise ModelError(f"{cube} is partitioned by {spec.column}; filter on it (require_filter is set)", "partition_filter_required")
 
     if spec.strategy == "column":
         if spec.kind == "list" or not bounds.bounded:

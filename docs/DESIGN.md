@@ -151,7 +151,13 @@ Every model table has `since_version INTEGER NOT NULL` and `until_version INTEGE
 | `migrations` | `id`, `description`, `checksum`, `ops` (JSON), `touches` (JSON), `kind` (additive, change or breaking), `status` (proposed, approved, applied, rolled_back or rejected), `base_version`, `version`, `proposed_by`, `approved_by`, `impact` (JSON dry-run report), timestamps |
 | `saved_queries` | Queries that apps and dashboards depend on, with `app`, `tenant` and `roles`. These are the inputs to impact analysis. ShipCube registers them automatically when an app is deployed. |
 | `audit_log` | Every `propose`, `approve`, `reject`, `dry_run`, `apply` and `rollback`, with actor, migration, version and details (including the entity diff). |
-| `settings` | `dialect` of the warehouse the member SQL is written in. |
+| `settings` | `dialect` of the warehouse the member SQL is written in, and the `workspace_id` that owns the catalog. |
+| `data_role_assignments` | `(principal_type, principal, role)`. Principal types follow security's `access_grants`: `user` (email), `group`, `domain`, plus `workspace_role`. Gives data roles such as `finance` or `regional_manager`. |
+| `data_attributes` | `(principal_type, principal, key, value)`. These are the `$ctx` values for row policies, such as `region`, or a sub-tenant `tenant`. The most specific principal wins. |
+
+`audit_log` uses the same columns as the security schema's `audit_log`: `workspace_id`, `actor_user_id`, `actor_token_id`, `actor_type`, `action` (`data.migration.apply`, `data.role.assign`, …), `target_type`, `target_id`, `detail` and `at`. In production the data layer writes to that table.
+
+Data roles and attributes are **not** versioned or migration-managed. They are access administration, which changes as people join and leave, and they are audited instead. Grants and row policies, which *reference* roles and attributes, are part of the model and do go through migrations.
 
 ### 4.3 Why SCD2
 
@@ -220,7 +226,7 @@ The demo uses two bindings:
 These properties hold:
 
 - **Fail closed.** No matching binding means an error, never an unqualified table.
-- **The tenant comes only from the `SecurityContext`.** ShipCube sets it from the verified identity: the gateway's signed assertion for apps, or the PAT/OAuth token's workspace for MCP. It must be a valid identifier, which blocks schema-name injection.
+- **The tenant comes only from the verified identity.** `identity.security_context` derives it from the caller's workspace (`ws_<uuid hex>`, per the security schema's tenant boundary). A sub-tenant can be assigned through a `tenant` data attribute, for example per customer domain. It must be a valid identifier, which blocks schema-name injection. See [MCP.md](MCP.md#identity-from-the-security-schema-to-a-security-context).
 - **Pooled tenancy.** `bind_schema` with `tenant_column` keeps shared tables and adds `cube.<tenant_column> = '<tenant>'` to every query on that cube.
 - **SQL cubes too.** Unqualified tables inside a cube's `sql` are qualified with the routed schema. CTE names are left alone.
 - **Escape hatch.** A cube whose `table` is already qualified (`analytics.dim_date`) is not routed. Prefer a binding.
@@ -320,7 +326,12 @@ sha256(
 
 ## 7. Production notes
 
-- **Catalog.** This is Cloud SQL Postgres in ShipCube's control project. Every table gains `workspace_id`, and RLS is applied like the rest of the API. `apply` takes `pg_advisory_xact_lock(hashtext(workspace_id))`, so migrations in a workspace are serialized. SQLite's `BEGIN IMMEDIATE` plays this role in the prototype.
+- **Catalog.** This is Cloud SQL Postgres in ShipCube's control project, alongside the security schema (`docs/research/database-design.md` in the main repo). Every table gains `workspace_id uuid references workspaces(id)`. RLS uses the same `app_workspace()` and `app_has_role()` functions:
+  - reads need `viewer`;
+  - proposals need `developer`;
+  - data roles and attributes need `admin`.
+
+  The API reaches the catalog as `shipcube_app`, which has no `BYPASSRLS`. `apply` takes `pg_advisory_xact_lock(hashtext(workspace_id))`, so migrations in a workspace are serialized. SQLite's `BEGIN IMMEDIATE` plays this role in the prototype.
 - **Warehouse credentials.** The connection secret is referenced by name and stored in Secret Manager. The layer connects with a read-only role. L3 runs with a statement timeout and byte cap (BigQuery `maximum_bytes_billed`).
 - **Approval URLs.** `propose_migration` returns a console URL. Following ShipCube's rule for risky MCP actions, the human approves there, not through the agent's token (see [MCP.md](MCP.md)).
 - **Saved queries.** These are registered when an app is deployed: ShipCube's deploy step records the typed queries an app makes. Impact analysis is only as good as this registry.
@@ -338,6 +349,7 @@ sha256(
 | L1 operators: `share`, `rank`, `lag`, `running`, `compare` | Built |
 | L2 stages | Designed in [QUERY.md](QUERY.md), not built |
 | L3 validator | Built (DuckDB-focused deny-list) |
+| In-process MCP library (`tools.py`) and identity mapping from the security schema (`identity.py`) | Built |
 | Dialects | DuckDB runs. Postgres, BigQuery and ClickHouse compile and parse back in tests, but no live warehouse was tested. |
 | Freshness tokens, pre-aggregations, BigQuery wildcard rendering | Designed, not built |
 | Postgres catalog with `workspace_id` | Designed, not built |

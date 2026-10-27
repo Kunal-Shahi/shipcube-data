@@ -155,14 +155,43 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     created_at TEXT NOT NULL
 );
 
+-- Who holds which data role. Principals follow the security schema's conventions
+-- (access_grants.principal_type): a user email, a Google group email, a domain, or a
+-- workspace membership role (owner/admin/developer/viewer). Not versioned: people come
+-- and go far more often than the model changes. Changes are audited.
+CREATE TABLE IF NOT EXISTS data_role_assignments (
+    principal_type TEXT NOT NULL CHECK (principal_type IN ('user', 'group', 'domain', 'workspace_role')),
+    principal      TEXT NOT NULL,            -- lower-cased email, group, domain or role
+    role           TEXT NOT NULL,            -- e.g. regional_manager, finance
+    granted_by     TEXT,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (principal_type, principal, role)
+);
+
+-- Values row policies read as $ctx.<key>, e.g. region = 'South' for one user or a whole domain.
+-- The most specific principal wins: user > group > domain > workspace_role.
+CREATE TABLE IF NOT EXISTS data_attributes (
+    principal_type TEXT NOT NULL CHECK (principal_type IN ('user', 'group', 'domain', 'workspace_role')),
+    principal      TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    value          TEXT NOT NULL,            -- JSON scalar or list
+    set_by         TEXT,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (principal_type, principal, key)
+);
+
+-- Same shape as the security schema's audit_log, so production can write to that table directly.
 CREATE TABLE IF NOT EXISTS audit_log (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    at           TEXT NOT NULL,
-    actor        TEXT,
-    action       TEXT NOT NULL,
-    migration_id TEXT,
-    version      INTEGER,
-    details      TEXT
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id   TEXT,
+    actor_user_id  TEXT,
+    actor_token_id TEXT,
+    actor_type     TEXT NOT NULL CHECK (actor_type IN ('user', 'token', 'system')),
+    action         TEXT NOT NULL,            -- data.migration.apply, data.role.assign, ...
+    target_type    TEXT NOT NULL,
+    target_id      TEXT NOT NULL,
+    detail         TEXT NOT NULL DEFAULT '{}',
+    at             TEXT NOT NULL
 );
 """
 
@@ -237,7 +266,7 @@ KEY_COLS = {t: [c.strip() for c in cols.split(",")] for t, cols in CURRENT_UNIQU
 
 
 class Catalog:
-    def __init__(self, path: str | Path = ":memory:", dialect: str = "duckdb"):
+    def __init__(self, path: str | Path = ":memory:", dialect: str = "duckdb", workspace_id: Optional[str] = None):
         self.path = str(path)
         self.db = sqlite3.connect(self.path, isolation_level=None)  # explicit transactions only
         self.db.row_factory = sqlite3.Row
@@ -246,6 +275,8 @@ class Catalog:
         for table, cols in CURRENT_UNIQUE.items():
             self.db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_current ON {table} ({cols}) WHERE until_version IS NULL")
         self.db.execute("INSERT OR IGNORE INTO settings VALUES ('dialect', ?)", (dialect,))
+        if workspace_id:
+            self.db.execute("INSERT OR IGNORE INTO settings VALUES ('workspace_id', ?)", (str(workspace_id),))
         self._cache: dict[int, Model] = {}
 
     # ------------------------------------------------------------ settings & versions
@@ -379,12 +410,66 @@ class Catalog:
             )
         ]
 
+    @property
+    def workspace_id(self) -> Optional[str]:
+        row = self.db.execute("SELECT value FROM settings WHERE key = 'workspace_id'").fetchone()
+        return row[0] if row else None
+
     def audit(self, action: str, actor: Optional[str] = None, migration_id: Optional[str] = None,
-              version: Optional[int] = None, **details: Any) -> None:
+              version: Optional[int] = None, *, target_type: str = "migration", target_id: Optional[str] = None,
+              **details: Any) -> None:
+        """Record an event. `actor` is a principal string: 'user:<id>', 'token:<id>' or a free-form system name."""
+        kind, _, ident = (actor or "system").partition(":")
+        if kind not in {"user", "token"} or not ident:
+            kind, ident = "system", None
+            if actor:
+                details["actor"] = actor
+        if version is not None:
+            details["version"] = version
         self.db.execute(
-            "INSERT INTO audit_log (at, actor, action, migration_id, version, details) VALUES (?, ?, ?, ?, ?, ?)",
-            (_now(), actor, action, migration_id, version, _j(details) if details else None),
+            "INSERT INTO audit_log (workspace_id, actor_user_id, actor_token_id, actor_type, action, target_type, target_id, detail, at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (self.workspace_id, ident if kind == "user" else None, ident if kind == "token" else None, kind,
+             action if "." in action else f"data.migration.{action}", target_type, target_id or migration_id or "-",
+             _j(details), _now()),
         )
+
+    # ------------------------------------------------------------ data roles and attributes
+
+    def assign_role(self, principal_type: str, principal: str, role: str, by: Optional[str] = None) -> None:
+        with self.transaction():
+            self.db.execute("INSERT OR IGNORE INTO data_role_assignments VALUES (?, ?, ?, ?, ?)",
+                            (principal_type, principal.lower(), role, by, _now()))
+            self.audit("data.role.assign", by, target_type="data_role", target_id=role,
+                       principal=f"{principal_type}:{principal.lower()}")
+
+    def unassign_role(self, principal_type: str, principal: str, role: str, by: Optional[str] = None) -> None:
+        with self.transaction():
+            self.db.execute("DELETE FROM data_role_assignments WHERE principal_type = ? AND principal = ? AND role = ?",
+                            (principal_type, principal.lower(), role))
+            self.audit("data.role.unassign", by, target_type="data_role", target_id=role,
+                       principal=f"{principal_type}:{principal.lower()}")
+
+    def set_attribute(self, principal_type: str, principal: str, key: str, value: Any, by: Optional[str] = None) -> None:
+        with self.transaction():
+            self.db.execute("INSERT OR REPLACE INTO data_attributes VALUES (?, ?, ?, ?, ?, ?)",
+                            (principal_type, principal.lower(), key, json.dumps(value), by, _now()))
+            self.audit("data.attribute.set", by, target_type="data_attribute", target_id=key,
+                       principal=f"{principal_type}:{principal.lower()}")
+
+    def principal_grants(self, principals: list[tuple[str, str]]) -> tuple[set[str], dict[str, Any]]:
+        """Roles and attributes for a set of (principal_type, principal), most specific attribute wins."""
+        if not principals:
+            return set(), {}
+        where = " OR ".join("(principal_type = ? AND principal = ?)" for _ in principals)
+        args = [x for p in principals for x in (p[0], p[1].lower())]
+        roles = {r[0] for r in self.db.execute(f"SELECT role FROM data_role_assignments WHERE {where}", args)}
+        rank = {"workspace_role": 0, "domain": 1, "group": 2, "user": 3}
+        attrs: dict[str, Any] = {}
+        rows = self.db.execute(f"SELECT principal_type, key, value FROM data_attributes WHERE {where}", args).fetchall()
+        for ptype, key, value in sorted(rows, key=lambda r: rank[r[0]]):
+            attrs[key] = json.loads(value)
+        return roles, attrs
 
     def audit_log(self) -> list[Row]:
         return [dict(r) for r in self.db.execute("SELECT * FROM audit_log ORDER BY id")]

@@ -26,7 +26,14 @@ ADDITIVE_AGGS = {"count", "sum"}
 
 
 class ModelError(ValueError):
-    """Raised when an operation or query is not valid against the model."""
+    """Raised when an operation or query is not valid against the model.
+
+    `code` is a stable, machine-readable reason that MCP tools return to agents.
+    """
+
+    def __init__(self, message: str, code: str = "invalid", hint: str | None = None):
+        super().__init__(message)
+        self.code, self.hint = code, hint
 
 
 def check_ident(value: str, what: str) -> str:

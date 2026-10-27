@@ -1,6 +1,29 @@
 # MCP tools
 
-The data layer gives coding agents six tools. ShipCube's MCP server (in the main `shipcube` repo) will register them and forward each call to the ShipCube API. The API builds the `SecurityContext` and calls `DataLayer` (`src/shipcube_data/engine.py`).
+The data layer gives coding agents six tools. They ship as an **in-process Python library**, `shipcube_data.tools.DataTools`, which ShipCube's MCP server mounts directly. The library has no transport of its own.
+
+```python
+from shipcube_data.tools import DataTools, ToolError
+from shipcube_data.identity import Caller
+
+tools = DataTools(layer_for=lambda workspace_id: data_layer_for(workspace_id))
+
+for spec in tools.specs():            # name, description, inputSchema (JSON Schema), scope
+    server.register(spec, handler=lambda args, caller, n=spec["name"]: tools.call(n, args, caller))
+
+# per request, after verifying the sc_pat_ / OAuth token:
+caller = Caller(workspace_id=ws.id, workspace_slug=ws.slug, via="mcp", email=user.email,
+                user_id=user.id, hosted_domain=user.hosted_domain, membership_role=m.role,
+                token_id=token.id, scopes=token.scopes)
+try:
+    result = tools.call("query", args, caller)   # plain JSON-able dict
+except ToolError as e:
+    return mcp_error(e.to_dict())                # {"code", "message", "hint"}
+```
+
+`DataTools.approve(migration_id, caller)` is the console's approve action. It is not an MCP tool.
+
+**Language decision.** Mounting in-process assumes the MCP server is Python, as language's PR #4 recommends. If the server stays in TypeScript (networking's PR #1), the same `DataTools.specs()`/`call()` pair sits behind a small internal HTTP endpoint, and nothing else changes. This waits on Kunal's language decision.
 
 | Tool | Scope | Calls |
 |---|---|---|
@@ -13,11 +36,35 @@ The data layer gives coding agents six tools. ShipCube's MCP server (in the main
 
 There is also an optional seventh tool, `raw_sql` (L3). It needs the `data:raw` scope and a workspace setting, and is off by default.
 
-**Security context.** The MCP server never accepts `tenant`, `roles` or policy attributes as tool arguments. The API derives them:
+## Identity: from the security schema to a security context
 
-- the **workspace** comes from the bearer token (`sc_pat_…` or an OAuth access token);
-- the **tenant** is the app or workspace binding the token is scoped to;
-- **roles and attributes** come from the token owner's workspace membership.
+Tool arguments never carry identity. The server builds a `Caller` (`identity.py`) from the tables in the security workstream's `docs/research/database-design.md`:
+
+| `Caller` field | From |
+|---|---|
+| `workspace_id`, `workspace_slug` | `workspaces` (the tenant boundary), resolved from the token or URL |
+| `email`, `user_id`, `hosted_domain` | `users` (`email`, `id`, Google `hd` claim) |
+| `membership_role` | `memberships.role`: `owner`, `admin`, `developer`, `viewer`, or none for an app viewer |
+| `via`, `token_id`, `scopes` | `mcp` + `api_tokens.id`/`scopes`, or `console` (human session), or `app` (gateway assertion) |
+| `groups`, `app_id` | Google groups when the gateway resolved them; `apps.id` for app traffic (viewer allowed by `access_grants`/IAP) |
+
+`security_context(caller, catalog)` turns that into what the compiler uses:
+
+- **tenant** is the workspace: `ws_<uuid hex>`, which bindings use through `{tenant}`. A data attribute `tenant` can instead assign a principal to a sub-tenant inside the workspace, for an app that serves several customers from one warehouse. For example, domain `acme.com` gets `tenant = acme` and routes to `tenant_acme`.
+- **roles** combine two sources. The first is `workspace:<role>` for the membership role and every role below it, so `workspace:admin` implies `workspace:developer` and `workspace:viewer`. The second is the data roles from the catalog's `data_role_assignments`, matched by user email, group, domain or workspace role. These are the same principal types as security's `access_grants`.
+- **attrs** for `$ctx` come from the catalog's `data_attributes`, where the most specific principal wins: user > group > domain > workspace role. Verified built-ins come last and cannot be overridden: `email`, `domain`, `user_id`, `workspace_id`, `workspace_slug` and `app_id`.
+
+The library also checks, before anything runs:
+
+| Rule | Error |
+|---|---|
+| The token has the tool's scope (`data:read` or `data:write`). Console and app requests are bounded by role and IAP instead. | `forbidden` |
+| The caller is a workspace member, or is reading through an app. | `forbidden` |
+| The catalog belongs to the caller's workspace. | `forbidden` |
+| `propose_migration` and `apply_migration` need `developer` or higher. | `forbidden` |
+| Approving needs a human console session, not a token. Developers may approve `additive` migrations; `change` and `breaking` migrations need `admin`. The approver must be a different principal from the proposer. The token's owner may approve their own agent's proposal from the console. | `forbidden` |
+
+Data roles and attributes are workspace access settings, not semantic-model changes, so they live outside migrations. The catalog's `assign_role`, `unassign_role` and `set_attribute` record every change in `audit_log`. The console's "Data access" page writes them.
 
 An agent can only ever see what its human could see.
 
@@ -121,16 +168,18 @@ Runs a typed L0/L1 query, or compiles it without running it.
 
 **Output** is the result object from [QUERY.md](QUERY.md#result): `columns`, `rows`, `sql`, `model_version`, `fingerprint`, `partitions`, `warnings`, `verified`, `cache`. The server truncates `rows` to the MCP response size budget and sets `"truncated": true`. Apps that need everything call the HTTP API.
 
-**Errors** are structured, so agents can repair a query without guessing:
+**Errors** are structured as `ToolError.to_dict()` → `{"code", "message", "hint"}`, so agents can repair a query without guessing. The codes come from `ModelError.code`:
 
-| `code` | Example `message` | Hint to the agent |
+| `code` | Example `message` | `hint` |
 |---|---|---|
-| `unknown_member` | `unknown or not permitted: orders.revnue` | Closest visible names: `order_items.revenue` |
-| `fan_out` | `orders.count would be inflated: joining orders -> order_items is one_to_many…` | Query from the other cube, or use a distinct count |
-| `no_join_path` | `no join path from order_items to states` | Propose an `add_join` |
-| `partition_filter_required` | `order_items is partitioned by shipping_limit_date; filter on it` | Add `time.range` |
-| `invalid_query` | Pydantic field errors (`filters.0.values: in_date_range takes [from, to]`) | |
-| `forbidden` | Missing scope or tenant binding | |
+| `unknown_member` | `unknown or not permitted: orders.cuont` | `did you mean orders.count?` (only visible members are suggested) |
+| `unknown_cube` | `unknown cube 'nope'` | `call list_cubes for the cubes you can see` |
+| `fan_out` | `orders.count would be inflated: joining orders -> order_items is one_to_many…` | (in the message) |
+| `no_join_path` | `no join path from order_items to states` | `propose an add_join …` |
+| `partition_filter_required` | `order_items is partitioned by shipping_limit_date; filter on it` | |
+| `invalid_arguments` | `query.limit: Input should be greater than or equal to 1` | `1 error(s) in total` |
+| `invalid` | Other query errors, such as mixing measures and dimensions in one filter group | |
+| `forbidden` | Missing scope, not a member, wrong workspace, missing `$ctx` value, no schema binding | |
 
 ## `search_values`
 
@@ -182,7 +231,7 @@ Validates, dry-runs and stores a migration for a human to approve. **It never ch
 }
 ```
 
-**Errors:** `invalid_op` (the op index and message), `conflict` (from the conflict check), and Pydantic field errors.
+**Errors:** `invalid_op` (`op 2 (change_sql): …`), `conflict` (from the conflict check), `invalid_arguments` and `forbidden` (needs `developer`).
 
 The proposer is recorded as `agent:<token id>` together with the token owner. ShipCube treats model changes as risky actions, so `approval_url` is a console page where a human reviews:
 
@@ -202,7 +251,7 @@ Applies a migration that a human has approved.
 
 **Behaviour**
 
-- The status must be `approved`. Otherwise the result is error `needs_approval` with the `approval_url`, and the model doesn't change.
+- The status must be `approved`. Otherwise the result is error `needs_approval`, with the `approval_url` in `hint`, and the model doesn't change.
 - Apply re-plans before writing. If another migration landed since the proposal, the result can be:
   - `conflict` (re-propose against the new head);
   - `would_break` (the impact now includes `breaks`; a human must re-approve with "allow breaking", which only the console offers).
@@ -232,9 +281,10 @@ The tool description tells agents to use `query` first. `raw_sql` is for one-off
 
 ## Wiring checklist (for the ShipCube MCP server)
 
-- [ ] Register the six tools. Generate their input schemas from `Query.model_json_schema()` and `OP_ADAPTER.json_schema()`.
-- [ ] Map token → `SecurityContext(tenant, user, roles, attrs)` in the API, never from tool arguments.
-- [ ] Map `ModelError` / `MigrationError` messages to the structured error codes above.
-- [ ] Add a console page at `/w/<ws>/data/migrations/<id>` with approve and reject buttons that call `Runner.approve` / `Runner.reject` under a human session.
+- [ ] Register `DataTools.specs()` as tools. The input schemas are already JSON Schema, generated from the Pydantic models.
+- [ ] Build `Caller` from the verified token, membership and workspace (see the identity section above), never from tool arguments.
+- [ ] Return `ToolError.to_dict()` as the MCP error payload.
+- [ ] Add a console page at `/w/<ws>/data/migrations/<id>` whose approve button calls `DataTools.approve` with the console session's `Caller`.
+- [ ] Add a console "Data access" page for data roles and attributes (`Catalog.assign_role` / `set_attribute`).
 - [ ] Register each deployed app's typed queries as `saved_queries` (name, app, tenant, roles), so impact analysis has something to check.
 - [ ] Settle the scope names `data:read`/`data:write` with the console's scope list.

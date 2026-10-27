@@ -11,6 +11,7 @@ Pipeline:
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ class SecurityContext(BaseModel):
         if key in {"tenant", "user", "roles"}:
             return getattr(self, key)
         if key not in self.attrs:
-            raise ModelError(f"security context has no {key!r}; refusing to run without it")
+            raise ModelError(f"security context has no {key!r}; refusing to run without it", "forbidden")
         return self.attrs[key]
 
 
@@ -103,7 +104,7 @@ class Compiler:
         if dialect not in DIALECTS:
             raise ModelError(f"unsupported dialect {dialect!r}; pick one of {', '.join(DIALECTS)}")
         if not _IDENT_RE.match(ctx.tenant):
-            raise ModelError(f"tenant {ctx.tenant!r} is not a valid identifier")
+            raise ModelError(f"tenant {ctx.tenant!r} is not a valid identifier", "forbidden")
         self.model, self.ctx, self.dialect, self.src = model, ctx, dialect, source_dialect
         self.warnings: list[str] = []
         self.partitions: dict[str, dict[str, Any]] = {}
@@ -129,15 +130,20 @@ class Compiler:
         try:
             cube, member = self.model.resolve(path)
         except ModelError:
-            raise ModelError(f"unknown or not permitted: {path}") from None
+            raise ModelError(f"unknown or not permitted: {path}", "unknown_member", self._closest(path)) from None
         if not self.visible(cube, member):
-            raise ModelError(f"unknown or not permitted: {path}")
+            raise ModelError(f"unknown or not permitted: {path}", "unknown_member", self._closest(path))
         if path != f"{cube.name}.{member.name}":
             self.warnings.append(f"{path} was renamed to {cube.name}.{member.name}; update the query")
         if member.deprecated:
             hint = f"; use {member.replaced_by}" if member.replaced_by else ""
             self.warnings.append(f"{cube.name}.{member.name} is deprecated ({member.deprecated}){hint}")
         return _Ref(cube, member, granularity, requested=path)
+
+    def _closest(self, path: str) -> str | None:
+        visible = [f"{c.name}.{m.name}" for c in self.model.cubes.values() for m in c.members() if self.visible(c, m)]
+        near = difflib.get_close_matches(path, visible, n=3, cutoff=0.6)
+        return f"did you mean {', '.join(near)}?" if near else None
 
     def policies_for(self, cube: str) -> list[Filter]:
         out = []
@@ -241,7 +247,7 @@ class Compiler:
         edges: list[_Edge] = []
         for target in sorted(needed - {root}):
             if target not in prev:
-                raise ModelError(f"no join path from {root} to {target}")
+                raise ModelError(f"no join path from {root} to {target}", "no_join_path", f"propose an add_join between {target} and a cube reachable from {root}")
             path = []
             node = target
             while prev[node] is not None:
@@ -263,7 +269,7 @@ class Compiler:
             b.get(f"{cube.name}@{tenant}") or b.get(f"{cube.name}@*") or b.get(f"*@{tenant}") or b.get("*@*")
         )
         if binding is None:
-            raise ModelError(f"no schema binding for cube {cube.name} and tenant {tenant}")
+            raise ModelError(f"no schema binding for cube {cube.name} and tenant {tenant}", "forbidden")
         return binding.schema_.replace("{tenant}", tenant), binding.tenant_column
 
     def source(self, cube: Cube, bounds: Bounds) -> tuple[exp.Expression, list[exp.Expression]]:
@@ -529,7 +535,8 @@ class Compiler:
             e = fanout[0]
             raise ModelError(
                 f"{unsafe[0].path} would be inflated: joining {e.src} -> {e.dst} is one_to_many. "
-                f"Query it from {e.dst}'s side, or use a count_distinct/min/max measure"
+                f"Query it from {e.dst}'s side, or use a count_distinct/min/max measure",
+                "fan_out",
             )
 
         all_filters = dim_filters + [f for fs in policies.values() for f in fs]

@@ -199,8 +199,9 @@ def test_agent_proposal_needs_a_different_human_to_approve(runner):
     runner.approve(mid, "kunal")
     out = runner.apply(runner.stored(mid), actor="agent:claude", require_approval=True)
     assert out["status"] == "applied" and out["version"] == 6
-    actions = [a["action"] for a in runner.catalog.audit_log()]
-    assert actions[-3:] == ["propose", "approve", "apply"]
+    log = runner.catalog.audit_log()
+    assert [a["action"] for a in log[-3:]] == ["data.migration.propose", "data.migration.approve", "data.migration.apply"]
+    assert log[-1]["target_id"] == mid and log[-1]["actor_type"] == "system"
 
 
 def test_catalog_rows_are_scd2(runner):

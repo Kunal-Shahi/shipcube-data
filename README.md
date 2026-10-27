@@ -84,7 +84,9 @@ src/shipcube_data/
   compiler.py    query -> sqlglot AST -> SQL; routing, RLS, grants, fan-out, stitching
   partitions.py  partition pruning
   rawsql.py      L3 validator
-  engine.py      DataLayer facade used by MCP tools; result cache
+  engine.py      DataLayer facade; result cache
+  identity.py    Caller (security schema: workspace, membership role, token scopes) -> SecurityContext
+  tools.py       the six MCP tools as an in-process library (DataTools.specs / call)
   demo.py        Olist-shaped DuckDB warehouse
 examples/olist/migrations/   the demo model as migrations
 tests/
