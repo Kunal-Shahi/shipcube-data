@@ -29,15 +29,15 @@ from shipcube_data import (
     DataTools, ToolError,          # the MCP tools + console actions
     Caller,                        # identity built from the security schema
     Catalog, DataLayer,            # catalog DB and query engine
-    MuseDrafter, MockMuse,         # migration drafting (Muse Spark, with rule fallback)
+    MuseDrafter,                   # migration drafting (Muse Spark when META_API_KEY is set, else rules)
     Datasource, SecretRef,         # warehouse connections
 )
 
-def data_layer_for(workspace_id):            # one catalog per workspace (Postgres in production)
+def data_layer_for(workspace_id):            # one catalog schema per workspace on Postgres
     catalog = Catalog(catalog_dsn_for(workspace_id), workspace_id=str(workspace_id))
     return DataLayer.from_catalog(catalog, resolve_secret=secret_manager_access, connectors=WAREHOUSE_CONNECTORS)
 
-tools = DataTools(layer_for=data_layer_for, drafter=MuseDrafter(muse_spark_client))
+tools = DataTools(layer_for=data_layer_for)   # drafter defaults to MuseDrafter.from_env()
 
 for spec in tools.specs():                   # data_list_cubes … data_propose_migration
     server.register(spec["name"], spec["description"], spec["inputSchema"],
@@ -308,7 +308,8 @@ ShipCube implements `muse_client` over its AI gateway. Here is how a draft is ma
 - **What `RuleDrafter` understands:**
   - a small English grammar: `add measure <name> as <sum|count|count distinct|average|min|max> of <column> on <cube>`, `add dimension <name> on <cube> from <column>`, `rename <cube.member> to <name>`, `deprecate <cube.member> because …`;
   - **lifting aggregates from SQL strings in app code.** `COUNT(DISTINCT customer_id) AS buyers FROM orders` becomes `add_measure orders.buyers`. Aggregates already in the model are reported as "already modelled as orders.count; query that instead".
-- **Testing.** `MockMuse(reply)` stands in for Muse in tests and demos, and records the prompts it was sent.
+- **The real client.** `muse.MetaMuseClient` is used whenever `META_API_KEY` is set (mount it from Secret Manager). It calls the Meta Model API, which is OpenAI-compatible (`META_API_BASE_URL`, default `https://api.meta.ai/v1`), with `META_MUSE_MODEL` (default `muse-spark-1.3`), low reasoning effort and 6000 max tokens. Muse Spark spends reasoning tokens inside `max_tokens`. Requests time out (`META_MUSE_TIMEOUT_S`), and 429, 5xx and network errors are retried with backoff. Every fallback to rules is logged as `draft.muse_fallback`. `tests/integration/test_muse_live.py` makes one real drafting call.
+- **Testing.** `shipcube_data.testing.MockMuse(reply)` stands in for Muse in unit tests only. It is not on any production path.
 
 ## `raw_sql` (optional, L3)
 

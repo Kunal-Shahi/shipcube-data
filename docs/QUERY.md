@@ -6,7 +6,7 @@ Queries are JSON documents validated by Pydantic (`src/shipcube_data/query.py`).
 |---|---|---|---|
 | **L0** | Typed measures, dimensions, filters, time, segments, order, limit | Governed definitions, joins chosen by the model, fan-out safety, RLS, routing, pruning | ✅ |
 | **L1** | Operators: `share`, `rank`, `lag`, `running`, `compare` | Same as L0. Operators work on L0 output columns only. | ✅ |
-| **L2** | Stages: CTEs, set operations, aliased self-joins, subqueries | Every stage that reads data is an L0/L1 query, so it is still governed | Designed |
+| **L2** | Stages: CTEs, set operations, aliased self-joins, subqueries | Every stage that reads data is an L0/L1 query, so it is still governed | Next (specified below) |
 | **L3** | Read-only raw SQL | Only scoping: one SELECT, own schemas, no table functions. Results are labelled `verified: false`. | ✅ (validator) |
 
 No level has company-specific metric kinds. Funnels, cohorts and retention are built from L1 and L2.
@@ -77,10 +77,11 @@ WITH g_orders AS (SELECT states.region AS states__region, COUNT(*) AS orders__co
                   FROM (…orders shards…) AS orders LEFT JOIN … GROUP BY states.region),
      g_order_items AS (SELECT states.region AS states__region, SUM(order_items.price) AS order_items__revenue
                   FROM tenant_acme.order_items AS order_items LEFT JOIN … GROUP BY states.region)
-SELECT COALESCE(g_orders.states__region, g_order_items.states__region) AS states__region,
-       g_orders.orders__count, g_order_items.order_items__revenue
-FROM g_orders FULL OUTER JOIN g_order_items
-  ON g_orders.states__region IS NOT DISTINCT FROM g_order_items.states__region
+     keys AS (SELECT states__region FROM g_orders UNION SELECT states__region FROM g_order_items)
+SELECT keys.states__region, g_orders.orders__count, g_order_items.order_items__revenue
+FROM keys
+LEFT JOIN g_orders      ON g_orders.states__region      IS NOT DISTINCT FROM keys.states__region
+LEFT JOIN g_order_items ON g_order_items.states__region IS NOT DISTINCT FROM keys.states__region
 ```
 
 Suppose a group would have to walk a `one_to_many` edge, such as `orders.count` by `products.category` (orders → order_items → products):
@@ -118,7 +119,7 @@ Suppose a group would have to walk a `one_to_many` edge, such as `orders.count` 
 
 ---
 
-## L2: stages (designed, not built)
+## L2: stages (specified; next to build)
 
 L2 composes named stages. **Every stage that reads data is an L0/L1 query**, so routing, RLS, grants and pruning still apply. The remaining stage kinds only work on the columns of earlier stages. This is how L2 adds power without opening a way around governance.
 
@@ -188,10 +189,24 @@ All SQL is built as sqlglot expressions and never by string concatenation. Membe
 | Time truncation | `DATE_TRUNC('MONTH', x)` | `DATE_TRUNC('MONTH', x)` | `TIMESTAMP_TRUNC(x, MONTH)` | `dateTrunc('MONTH', x)` |
 | Timestamp literal | `CAST('…' AS TIMESTAMP)` | `CAST('…' AS TIMESTAMP)` | `CAST('…' AS DATETIME)` ⚠️ | `CAST('…' AS Nullable(DateTime))` |
 | Period shift (`compare`) | `x + INTERVAL 1 MONTH` | `x + INTERVAL '1 MONTH'` | `DATE_ADD(x, INTERVAL 1 MONTH)` | `DATE_ADD(MONTH, 1, x)` |
-| Null-safe join (stitching) | `IS NOT DISTINCT FROM` | `IS NOT DISTINCT FROM` | `IS NOT DISTINCT FROM` | `IS NOT DISTINCT FROM` ⚠️ |
+| Null-safe join (stitching) | `LEFT JOIN … IS NOT DISTINCT FROM` | same | same | same ⚠️ |
 
-The tests compile the same multi-fact, filtered, pruned, `compare` query to all four dialects and parse each result back with that dialect's parser. Only DuckDB is executed. Known issues to check against live warehouses:
+The tests compile the same multi-fact, filtered, pruned, `compare` query to all four dialects and parse each result back with that dialect's parser.
 
-- **BigQuery** distinguishes `DATETIME` from `TIMESTAMP`. Time dimensions need a declared physical type, so literals are cast to match the column.
-- **ClickHouse** supports `IS NOT DISTINCT FROM` in `JOIN ON` only in recent versions. The fallback is `(a = b OR (a IS NULL AND b IS NULL))` or `isNotDistinctFrom`. ClickHouse also needs `join_use_nulls = 1` for correct `FULL OUTER JOIN` stitching.
+The integration suite (`tests/integration/`) then *executes* a set of governed queries on DuckDB, Cloud SQL Postgres and BigQuery, and requires identical answers. The set covers:
+
+- partition pruning;
+- multi-fact stitching;
+- fan-out-safe distinct counts;
+- filters and segments;
+- HAVING;
+- L1 `share`, `running` and `compare`;
+- row policies.
+
+Dialect handling found or confirmed this way:
+
+- **BigQuery's `TIMESTAMP`** is sqlglot's `TIMESTAMPTZ`; its `DATETIME` is naive. Timestamp literals are cast to `TIMESTAMP` for BigQuery.
+- **BigQuery period shifts.** `TIMESTAMP_ADD` has no `MONTH` or `YEAR`, so `compare` shifts through `DATETIME_ADD`.
+- **Postgres stitching.** Postgres rejects `FULL JOIN` on `IS NOT DISTINCT FROM`, hence the `keys` union above.
+- **ClickHouse** supports `IS NOT DISTINCT FROM` in `JOIN ON` only in recent versions. The fallback is `isNotDistinctFrom`. It also needs `join_use_nulls = 1` for correct stitching.
 - **Integer division** differs by dialect: Postgres truncates. Ratio measures should multiply by `1.0` (the demo's `late_rate` does), or the compiler could cast `number` measures to a float type.

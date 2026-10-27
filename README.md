@@ -2,7 +2,7 @@
 
 ShipCube's data layer is a semantic layer whose models live in a database, not in YAML files.
 
-You define base cubes, measures, dimensions and joins through versioned **model migrations**. Migrations are applied to and stored in a catalog database. Queries are typed and compile to SQL over a single warehouse database, organised by schema and partition.
+You define base cubes, measures, dimensions and joins through versioned **model migrations**. Migrations are applied to and stored in a catalog database: Postgres in production, with a schema per workspace. Queries are typed and compile to SQL over one warehouse database, organised by schema and partition. That warehouse is Cloud SQL Postgres or BigQuery, with timeouts, row limits and cost guards on every query.
 
 Part of [ShipCube](https://github.com/Kunal-Shahi/shipcube).
 
@@ -12,13 +12,14 @@ Part of [ShipCube](https://github.com/Kunal-Shahi/shipcube).
 - [docs/MIGRATIONS.md](docs/MIGRATIONS.md) covers the migration vocabulary, ordering, idempotency, rollback, conflict detection, dry-run with impact analysis, and how agents propose migrations that humans approve.
 - [docs/QUERY.md](docs/QUERY.md) covers the query language (L0 typed, L1 operators, L2 stages, L3 raw SQL) and dialects.
 - [docs/MCP.md](docs/MCP.md) covers the MCP tools exposed to coding agents.
+- [docs/RUNBOOK.md](docs/RUNBOOK.md) covers configuration (environment variables), deploying (catalog-schema migrations), operating (logs, metrics, common incidents) and known limits.
 
 ## Use it from ShipCube
 
 The package needs Python 3.12. Add it as a git dependency:
 
 ```toml
-dependencies = ["shipcube-data @ git+https://github.com/Kunal-Shahi/shipcube-data@main"]
+dependencies = ["shipcube-data[postgres,bigquery] @ git+https://github.com/Kunal-Shahi/shipcube-data@<tag or commit>"]
 ```
 
 Then import from the top-level package:
@@ -45,13 +46,15 @@ uv pip install -p .venv -e '.[dev]'
 .venv/bin/pytest
 ```
 
+Set `SHIPCUBE_TEST_PG_URL` to a Postgres URL to also run every catalog test and the Postgres warehouse integration tests on Postgres. CI does this. `SHIPCUBE_TEST_BQ_PROJECT` and `META_API_KEY` enable the BigQuery and live Muse tests; see [docs/RUNBOOK.md](docs/RUNBOOK.md#3-run-locally).
+
 Or with plain pip:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]' && .venv/bin/pytest
 ```
 
-The tests build an Olist-shaped DuckDB warehouse in memory and apply the demo migrations in `examples/olist/migrations`. They then check compiled queries against hand-written SQL. The warehouse has:
+The unit tests build an Olist-shaped DuckDB warehouse in memory and apply the demo migrations in `examples/olist/migrations`. They then check compiled queries against hand-written SQL. The integration tests load the same synthetic data into Postgres and BigQuery and require identical answers. The warehouse has:
 
 - one database;
 - schemas `tenant_acme`, `tenant_globex` and `shared`;
@@ -94,7 +97,8 @@ The tests build an Olist-shaped DuckDB warehouse in memory and apply the demo mi
 src/shipcube_data/
   model.py       in-memory semantic model, fingerprints
   ops.py         migration vocabulary (18 ops), inference, conflict keys
-  catalog.py     catalog DB (SQLite here, Postgres in production), SCD2 versioning
+  db.py          Postgres / SQLite connections, catalog lock, catalog-schema migrations (catalog_migrations/)
+  catalog.py     SCD2-versioned model storage, audit, saved queries, data roles and attributes
   migrate.py     runner: status, dry-run + impact, apply, rollback, propose/approve
   query.py       typed query language (L0 + L1)
   compiler.py    query -> sqlglot AST -> SQL; routing, RLS, grants, fan-out, stitching
@@ -103,7 +107,11 @@ src/shipcube_data/
   engine.py      DataLayer facade; result cache
   identity.py    Caller (security schema: workspace, membership role, token scopes) -> SecurityContext
   tools.py       the five data_ MCP tools (DataTools.specs / call) + console-only approve / apply / register_datasource
-  drafting.py    drafting migrations from English or app code: Muse Spark hook, rule fallback, MockMuse
+  drafting.py    drafting migrations from English or app code: Muse Spark first, deterministic rules as fallback
+  muse.py        Meta Model API client for Muse Spark (enabled by META_API_KEY)
+  warehouses.py  DuckDB / Cloud SQL Postgres / BigQuery adapters with timeouts, row limits, cost guards
+  obs.py         JSON logs, query and request ids, metrics hook
+  testing.py     test doubles (MockMuse); never used on production paths
   datasources.py warehouse connections from secret references; connector registry
   demo.py        Olist-shaped DuckDB warehouse
 examples/olist/migrations/   the demo model as migrations

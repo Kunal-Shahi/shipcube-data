@@ -9,17 +9,19 @@ Related docs:
 - [MIGRATIONS.md](MIGRATIONS.md): the migration vocabulary, which is the core of the design.
 - [QUERY.md](QUERY.md): the query language, levels L0 to L3.
 - [MCP.md](MCP.md): the tools coding agents use.
+- [RUNBOOK.md](RUNBOOK.md): configuring, deploying and operating the service.
 
-The prototype in `src/shipcube_data` implements:
+The implementation is in `src/shipcube_data`. Its parts:
 
-- the catalog
-- the migration runner
-- the L0 and L1 compiler
-- schema routing, partition pruning and row-level security
-- the cache keys
-- the L3 validator
+- the catalog: Postgres in production, SQLite for local development, with versioned catalog-schema migrations;
+- the migration runner, safe under concurrency;
+- the L0 and L1 compiler, with schema routing, partition pruning and row-level security;
+- warehouse adapters for Cloud SQL Postgres and BigQuery (DuckDB for local development), with timeouts, row limits and cost guards;
+- the result cache, structured logs and metrics;
+- the L3 validator;
+- the MCP tools library.
 
-The tests run against DuckDB.
+Tests run on SQLite and Postgres catalogs. Integration tests run the same governed queries on DuckDB, real Postgres and real BigQuery, and require identical answers.
 
 ---
 
@@ -42,7 +44,7 @@ The tests run against DuckDB.
 
 ### Non-goals (for now)
 
-- **Pre-aggregations or materialization.** The design leaves room for them (§6), but the prototype always queries base tables.
+- **Pre-aggregations or materialization.** The design leaves room for them (§6), but queries always read base tables today.
 - **Many warehouses.** The design assumes one warehouse connection and dialect per catalog. Federation is out of scope.
 - **Company-specific metric kinds.** There are no "conversion funnels" or "cohorts" as built-in types. You build them from generic L1 and L2 operators.
 - **Data writes.** The layer is read-only against the warehouse. Migrations change the catalog, never warehouse tables.
@@ -94,7 +96,7 @@ You can still keep migrations in Git, as the demo's `examples/olist/migrations/*
                                          │                  │
                          verified identity → SecurityContext │
                                                             ▼
-            ┌──────────── catalog DB (SQLite here, Postgres in prod) ───────────┐
+            ┌──── catalog DB (Postgres, a schema per workspace; SQLite in dev) ──┐
             │ cubes, members, member_aliases, joins, segments, partition_specs, │
             │ schema_bindings, row_policies   (all SCD2: since/until version)   │
             │ model_versions, migrations, saved_queries, audit_log, settings    │
@@ -110,11 +112,16 @@ You can still keep migrations in Git, as the demo's `examples/olist/migrations/*
 |---|---|
 | `model.py` | The in-memory model. Fingerprints for the whole model and per cube. |
 | `ops.py` | The migration vocabulary. Each op is a Pydantic model with `apply()` and `touches()`. |
-| `catalog.py` | The catalog DDL. SCD2 persistence by diffing two models. Model loading at any version. |
+| `db.py`, `catalog_migrations/` | Connections (Postgres or SQLite), transactions with the per-catalog lock, versioned catalog-schema migrations. |
+| `catalog.py` | SCD2 persistence by diffing two models. Model loading at any version. |
 | `migrate.py` | Status, dry-run with impact analysis, apply, rollback, propose and approve. |
 | `query.py`, `compiler.py`, `partitions.py` | Typed queries in, SQL out. |
 | `rawsql.py` | The L3 validator. |
-| `engine.py` | The facade the MCP tools call: `list_cubes`, `describe_cube`, `query`, `search_values`, `raw_sql`. Also the result cache. |
+| `engine.py` | The facade the MCP tools call: `list_cubes`, `describe_cube`, `query`, `search_values`, `raw_sql`. Also the result cache, query ids and query logs. |
+| `warehouses.py`, `datasources.py` | DuckDB, Cloud SQL Postgres and BigQuery adapters with guardrails; datasources registered from secret references. |
+| `identity.py`, `tools.py` | The caller model from the security schema; the `data_` MCP tools and console actions. |
+| `drafting.py`, `muse.py` | Migration drafting with Muse Spark, and the deterministic rule fallback. |
+| `obs.py` | JSON logs, request and query ids, the metrics hook. |
 
 Migrations are **pure functions on the model**. `apply_ops(model, ops)` returns a new `Model`. The catalog persists the *difference* between the old and new model as SCD2 rows. Because of that:
 
@@ -126,7 +133,9 @@ Migrations are **pure functions on the model**. `apply_ops(model, ops)` returns 
 
 ## 4. The catalog schema
 
-The full DDL is in `src/shipcube_data/catalog.py`. Production uses Postgres with the same tables plus a `workspace_id` column on every table. Isolation between workspaces uses Postgres RLS on `current_setting('app.workspace_id')`, as the rest of ShipCube's API does.
+The DDL lives in versioned catalog-schema migrations, `src/shipcube_data/catalog_migrations/{postgres,sqlite}/NNNN_*.sql`. They are recorded in `catalog_schema_migrations` with a checksum, so editing an applied file is refused. `shipcube-data catalog-migrate` applies them under a session advisory lock. Postgres uses `JSONB` and `TIMESTAMPTZ`; SQLite stores the same data as `TEXT`.
+
+**One Postgres schema per workspace.** On Postgres, each workspace's catalog lives in its own schema, `catalog_ws_<workspace uuid hex>`. The connection's `search_path` points at that schema. This gives hard isolation between workspaces without a `workspace_id` predicate in every statement. Each workspace also gets its own migration lock and its own schema-migration state. The trade-off: a schema per workspace is fine for thousands of workspaces, but listing across workspaces needs a `UNION` over schemas, which only operators ever need.
 
 ### 4.1 Model tables (versioned)
 
@@ -201,7 +210,7 @@ The compiler is in `compiler.py`. Its steps, in order:
 7. **Sources.** For each cube, apply tenant schema routing (§5.1) and partition pruning (§5.2).
 8. **Assemble.** `SELECT dims, aggregates FROM root LEFT JOIN ... WHERE ... GROUP BY ... HAVING ...`.
    - With more than one group, each group becomes a CTE.
-   - The CTEs are stitched with `FULL OUTER JOIN ... ON dim IS NOT DISTINCT FROM dim`, using `COALESCE` for the dimension columns.
+   - A `keys` CTE is the `UNION` (distinct) of every group's dimension values. Each group is `LEFT JOIN`ed to it on `dim IS NOT DISTINCT FROM dim`. An earlier `FULL OUTER JOIN` form was rejected by real Postgres ("FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"); the integration tests caught it.
    - This is how "orders and item revenue by state" stays correct without symmetric aggregates.
 9. **L1 calcs** wrap the result as CTE `base` and add window functions (see [QUERY.md](QUERY.md)).
 10. **Render** for the target dialect. The result includes:
@@ -315,7 +324,7 @@ sha256(
 
 - **Model invalidation is exact and needs no extra work.** A migration that changes `customers.state` changes the fingerprint of every query that touches `customers` (including through joins and policies), so those queries miss. A migration that adds a measure to `products` leaves queries over `customers` alone, and they keep hitting. `test_cache_is_keyed_by_the_fingerprint_of_used_cubes` covers both cases. There is no explicit purge: stale entries age out of the LRU.
 - **Security is part of the key.** Two tenants, or two role sets, never share an entry. Neither do two values of a policy attribute.
-- **Data freshness.** In the prototype this is a TTL. In production, the freshness token is computed per partition:
+- **Data freshness.** Today this is a TTL (`ResultCache(ttl_seconds=300)`). The planned freshness token is computed per partition:
   - **Closed** range partitions (`orders_2017_03`, or last month's partition of a column-partitioned table) are immutable after a grace period. Their token is constant, so cache entries over them live until evicted.
   - The **open** partition contributes the warehouse's last-modified time (`INFORMATION_SCHEMA.PARTITIONS.last_modified_time` on BigQuery, `system.parts` on ClickHouse, `pg_stat_user_tables` on Postgres) or a short TTL.
 
@@ -332,18 +341,46 @@ sha256(
   - proposals need `developer`;
   - data roles and attributes need `admin`.
 
-  The API reaches the catalog as `shipcube_app`, which has no `BYPASSRLS`. `apply` takes `pg_advisory_xact_lock(hashtext(workspace_id))`, so migrations in a workspace are serialized. SQLite's `BEGIN IMMEDIATE` plays this role in the prototype.
-- **Warehouse credentials.** The connection secret is referenced by name and stored in Secret Manager. The layer connects with a read-only role. L3 runs with a statement timeout and byte cap (BigQuery `maximum_bytes_billed`).
+  The API reaches the catalog as `shipcube_app`, which has no `BYPASSRLS`.
+- **Concurrency.** Every write (`apply`, `propose`, `approve`, `reject`, `rollback`) runs in one transaction that first takes `pg_advisory_xact_lock(<key of the workspace schema>)`. On SQLite, `BEGIN IMMEDIATE` plays this role. Inside the lock the runner re-reads the head and re-checks four things, so concurrent appliers serialise and the loser sees the winner's version:
+  - the approval status;
+  - the checksum;
+  - conflicts;
+  - the impact on saved queries.
+
+  Conflicts are checked before ops are applied. So if one migration renames a member while another edits it, the second gets `conflict, rebase` rather than a confusing op error. `tests/test_concurrency.py` races real connections on both backends.
+- **Warehouses and guardrails.** Credentials are referenced through `secret_refs` and resolved from Secret Manager at connect time. For BigQuery, the runtime service account (ADC) is preferred. Every query, L0 to L3, runs through an adapter that enforces `QueryLimits`:
+
+  | Guard | Cloud SQL Postgres | BigQuery | DuckDB (dev) |
+  |---|---|---|---|
+  | Timeout | `SET LOCAL statement_timeout` | job `result(timeout)` and `job.cancel()` | `interrupt()` from a timer |
+  | Rows | server-side cursor, `fetchmany(max_rows + 1)`, `truncated` flag | `max_results = max_rows + 1` | `fetchmany` |
+  | Cost | `EXPLAIN (FORMAT JSON)` total cost vs `max_cost` | dry-run bytes vs `max_bytes_billed`, and `maximum_bytes_billed` on the job | none |
+  | Read-only | `SET TRANSACTION READ ONLY` | read-only IAM role | read-only file |
+  | Tracing | `/* shipcube query_id=… */` comment | job label `shipcube_query_id` | |
+
+  Failures map to error codes: `query_timeout`, `cost_limit`, `warehouse_unavailable` (after retries with backoff) and `warehouse_error`.
+- **Observability.** Every query logs one JSON event, `query.ok` or `query.error`, with:
+  - `query_id` and `request_id`, and `trace` when the caller sets them;
+  - `workspace_id`, `tenant` and `user`;
+  - the cubes, fingerprint and model version;
+  - partitions scanned, rows, `truncated`, cache hit or miss, and `elapsed_ms`;
+  - warehouse stats: planner cost, or bytes processed and billed.
+
+  Migrations log `migration.proposed`, `migration.applied` and `migration.rolled_back`. Muse logs `muse.ok`, `muse.retry` and `draft.muse_fallback`. Logs never contain row data or secrets; SQL is logged as a hash. Metrics go through a `Metrics` hook (`data_queries_total`, `data_query_duration_ms`, `data_query_errors_total`), which the service wires to Cloud Monitoring.
 - **Approval URLs.** `data_propose_migration` returns a console URL. Following ShipCube's rule for risky MCP actions, the human approves there, not through the agent's token (see [MCP.md](MCP.md)).
 - **Saved queries.** These are registered when an app is deployed: ShipCube's deploy step records the typed queries an app makes. Impact analysis is only as good as this registry.
 
 ---
 
-## 8. Prototype status
+## 8. Status and known limits
 
 | Area | Status |
 |---|---|
-| Catalog (SQLite, SCD2, audit, saved queries) | Built |
+| Catalog on Postgres (a schema per workspace) and SQLite, SCD2, audit, saved queries, versioned catalog-schema migrations | Built; tested on both |
+| Concurrency-safe apply, propose, approve and rollback | Built; raced on both backends |
+| Warehouse adapters with timeouts, row limits and cost guards | Cloud SQL Postgres and BigQuery integration-tested against real servers; DuckDB for development |
+| Structured JSON logs with query and request ids; metrics hook | Built |
 | Migration runner: apply, status, dry-run with impact, rollback, conflict detection, propose, approve | Built |
 | 18 ops (see [MIGRATIONS.md](MIGRATIONS.md)) | Built |
 | L0 compiler: routing, pruning (table, column and list), RLS, grants, fan-out, multi-fact stitching | Built |
@@ -351,9 +388,16 @@ sha256(
 | L2 stages | Designed in [QUERY.md](QUERY.md), not built |
 | L3 validator | Built (DuckDB-focused deny-list) |
 | In-process MCP library (`tools.py`, five `data_` tools plus console-only approve, apply and register_datasource) and identity mapping from the security schema (`identity.py`) | Built |
-| Migration drafting: Muse Spark hook, rule-based fallback, `MockMuse` (`drafting.py`) | Built (Muse mocked) |
-| Datasource registration from secret references (`datasources.py`) | Built (DuckDB connector; others supplied by the API) |
+| Migration drafting: real Muse Spark (`muse-spark-1.3`) when `META_API_KEY` is set, rule fallback otherwise (logged) | Built; live-tested |
+| Datasource registration from secret references; DuckDB, Postgres and BigQuery connectors | Built |
 | Installable package (`pip install git+…`, examples bundled in the wheel) | Built |
-| Dialects | DuckDB runs. Postgres, BigQuery and ClickHouse compile and parse back in tests, but no live warehouse was tested. |
-| Freshness tokens, pre-aggregations, BigQuery wildcard rendering | Designed, not built |
-| Postgres catalog with `workspace_id` | Designed, not built |
+| Dialects | DuckDB, Postgres and BigQuery are executed in tests. ClickHouse compiles and parses back, but has no adapter or live test yet. |
+| Next | L1 operators extended and L2 stages (stages are specified in [QUERY.md](QUERY.md)); freshness tokens; pre-aggregations; BigQuery wildcard rendering; a ClickHouse adapter |
+
+Known limits:
+
+- **Result cache.** It is in-process, so each Cloud Run instance has its own. Use Memorystore when instances scale out.
+- **Rollback** pops only the head version. Older migrations are reverted with a new forward migration, written by hand for now.
+- **Row-limit truncation on Postgres** happens after the planner's LIMIT; the compiler already caps `limit` at `max_rows`.
+- **The Postgres cost guard is the planner's estimate,** not a measured cost. Stale statistics can let an expensive query through, which the timeout then catches.
+- **The L3 validator is a deny-list** tuned for DuckDB and Postgres. Production keeps L3 off by default.

@@ -1,4 +1,4 @@
-"""The catalog database (SQLite in the prototype, Postgres in production).
+"""The catalog database: Postgres in production (a schema per workspace), SQLite for local development.
 
 Every model table is versioned SCD2-style: a row is valid from `since_version`
 until `until_version` (exclusive; NULL = still current). That gives us:
