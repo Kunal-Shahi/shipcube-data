@@ -61,6 +61,36 @@ class ResultCache:
             self.data.popitem(last=False)
 
 
+def pin_definitions(head: Model, pinned: Model) -> Model:
+    """The model a pinned query runs against: head, with member *definitions* taken from the pin.
+
+    Everything that decides who sees what stays at head: grants, row policies, schema bindings,
+    joins, partitions, segments and the cube sources. A pin can only bring back how a member
+    that still exists was computed (its SQL, aggregation and filter). Members that no longer
+    exist at head are not resurrected. (Red-team issue #2: pinning an old version must never
+    bring back old access rules.)
+    """
+    out = head.model_copy(deep=True)
+    for cube in out.cubes.values():
+        old_cube = pinned.cubes.get(cube.name)
+        if old_cube is None:
+            continue
+        # names under which each current member was known at the pin: itself, plus renamed-from aliases
+        names_for: dict[str, list[str]] = {m.name: [m.name] for m in cube.members()}
+        for alias, target in cube.aliases.items():
+            names_for.setdefault(target, []).append(alias)
+        for member in cube.members():
+            old = next((old_cube.member(n) for n in names_for[member.name] if old_cube.member(n)), None)
+            if old is None or old.kind != member.kind:
+                continue
+            member.sql = old.sql
+            if hasattr(member, "agg"):
+                member.agg, member.filter = old.agg, old.filter  # type: ignore[attr-defined]
+            else:
+                member.type = old.type  # type: ignore[attr-defined]
+    return out
+
+
 class DataLayer:
     def __init__(self, catalog: Catalog, execute: Executor, cache: Optional[ResultCache] = None,
                  limits: Optional[QueryLimits] = None, metrics: Optional[Metrics] = None):
@@ -147,7 +177,9 @@ class DataLayer:
 
     def compile(self, query: Query | dict, ctx: SecurityContext, dialect: Optional[str] = None):
         q = query if isinstance(query, Query) else Query.model_validate(query)
-        model = self._model(q.model_version)
+        model = self._model()
+        if q.model_version is not None and q.model_version != self.catalog.head():
+            model = pin_definitions(model, self._model(q.model_version))
         return Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q), q
 
     def query(self, query: Query | dict, ctx: SecurityContext, *, use_cache: bool = True) -> dict[str, Any]:

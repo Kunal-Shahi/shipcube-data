@@ -12,16 +12,13 @@ from sqlglot import exp
 
 from .compiler import Compiler, SecurityContext
 from .model import Model, ModelError
-from .sqlutil import parse_query
+from .sqlutil import forbidden_function, parse_query
 
 FORBIDDEN = (
     exp.Insert, exp.Update, exp.Delete, exp.Merge, exp.Create, exp.Drop, exp.Alter,
     exp.Command, exp.TruncateTable, exp.Set, exp.Use, exp.Transaction, exp.Commit, exp.Rollback,
     exp.Into, exp.Copy, exp.Pragma, exp.Attach, exp.Detach,
 )
-FORBIDDEN_FUNCS = {"read_csv", "read_csv_auto", "read_parquet", "read_json", "read_json_auto", "read_text", "read_blob",
-                   "glob", "getenv", "query", "query_table", "sniff_csv", "pg_read_file", "external_query", "url", "file",
-                   "s3", "remote", "mysql", "postgresql"}
 SYSTEM_SCHEMAS = {"information_schema", "pg_catalog", "system", "main"}
 
 
@@ -49,7 +46,7 @@ def validate(sql: str, model: Model, ctx: SecurityContext, dialect: str, limit: 
             raise ModelError(f"raw SQL may not contain {node.key.upper()}")
         if isinstance(node, exp.Func):
             name = (node.name if isinstance(node, exp.Anonymous) else node.sql_name()).lower()
-            if name in FORBIDDEN_FUNCS or name.startswith(("read_", "pg_")) or isinstance(node, (exp.ReadCSV,)):
+            if forbidden_function(node):
                 raise ModelError(f"raw SQL may not call {name}")
     comp = Compiler(model, ctx, dialect, dialect)
     if any(comp.policies_for(c) for c in model.cubes):

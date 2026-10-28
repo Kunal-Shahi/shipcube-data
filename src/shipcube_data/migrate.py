@@ -102,6 +102,7 @@ class Runner:
             "id": m.id,
             "status": "planned",
             "kind": m.kind(),
+            "widens_exposure": m.widens_exposure(),
             "summary": summarize(m.ops, new),
             "base_version": base,
             "head_version": self.catalog.head(),
@@ -214,7 +215,7 @@ class Runner:
     # ------------------------------------------------------------ agent proposals
 
     def propose(self, ops: list[dict[str, Any]], description: str, proposed_by: str,
-                migration_id: Optional[str] = None) -> dict[str, Any]:
+                migration_id: Optional[str] = None, proposed_by_user: Optional[str] = None) -> dict[str, Any]:
         """Validate, dry-run and store a migration for a human to approve. Never applies it."""
         with self.catalog.transaction() as cat:  # the lock also makes id allocation race-free
             mid = migration_id or self._next_id(description)
@@ -224,21 +225,26 @@ class Runner:
                 id=m.id, description=description, checksum=m.checksum(),
                 ops=json.dumps([op.model_dump(mode="json", by_alias=True, exclude_defaults=True) for op in m.ops]),
                 touches=json.dumps(report["touches"]), kind=m.kind(), status="proposed",
-                base_version=m.base_version, proposed_by=proposed_by, impact=json.dumps(report["impact"]),
+                base_version=m.base_version, proposed_by=proposed_by, proposed_by_user=proposed_by_user,
+                impact=json.dumps(report["impact"]),
             )
             cat.audit("propose", proposed_by, m.id, kind=m.kind())
         log_event("migration.proposed", migration_id=m.id, kind=m.kind(), actor=proposed_by,
                   breaks=len(report["impact"]["breaks"]), workspace_id=self.catalog.workspace_id)
         return report | {"status": "proposed", "migration": m.model_dump(mode="json", by_alias=True, exclude_defaults=True)}
 
-    def approve(self, mid: str, approver: str) -> None:
+    def approve(self, mid: str, approver: str, approver_user: Optional[str] = None) -> None:
+        """Approve a proposal. The approver must be a different *person*: a token and its owner's
+        console session are the same human (compared through `*_by_user`)."""
         with self.catalog.transaction() as cat:
             rec = cat.migration(mid)
             if not rec or rec["status"] != "proposed":
                 raise MigrationError(f"{mid} is not a pending proposal", "not_found")
-            if approver == rec["proposed_by"]:
-                raise MigrationError("a proposal must be approved by someone other than its proposer", "forbidden")
-            cat.upsert_migration(id=mid, status="approved", approved_by=approver)
+            same_principal = approver == rec["proposed_by"]
+            same_person = bool(approver_user) and approver_user == rec.get("proposed_by_user")
+            if same_principal or same_person:
+                raise MigrationError("a proposal must be approved by someone other than the person who proposed it", "forbidden")
+            cat.upsert_migration(id=mid, status="approved", approved_by=approver, approved_by_user=approver_user)
             cat.audit("approve", approver, mid)
 
     def reject(self, mid: str, approver: str, reason: str = "") -> None:

@@ -346,3 +346,34 @@ def test_order_by_time_member_path(dl, acme):
     res = dl.query({"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": "year"},
                     "order": [{"member": "orders.purchased_at", "dir": "desc"}]}, acme)
     assert [r["orders__purchased_at__year"].year for r in res["rows"]] == [2018, 2017]
+
+
+# ---------------------------------------------------------------- red-team #2: pins never restore old access rules
+
+def test_pinned_version_keeps_current_row_policies_and_grants(runner, dl):
+    manager = SecurityContext(tenant="globex", roles=["regional_manager"], attrs={"region": "South"})
+    # Version 4 predates 0005_access: no own_region policy, no finance-only grant on freight.
+    with pytest.raises(ModelError, match="not permitted: order_items.freight"):
+        dl.query({"measures": ["order_items.freight"], "dimensions": ["states.region"], "model_version": 4}, manager)
+    res = dl.query({"measures": ["orders.count"], "dimensions": ["states.region"], "model_version": 4}, manager)
+    assert [r["states__region"] for r in res["rows"]] == ["South"]
+
+
+def test_pinned_version_keeps_current_bindings(runner, dl, acme):
+    apply(runner, "0006_move", {"op": "bind_schema", "tenant": "acme", "schema": "tenant_globex"})
+    sql = dl.compile({"measures": ["orders.count"], "model_version": 5}, acme)[0].sql
+    assert "tenant_globex" in sql and "tenant_acme" not in sql
+
+
+def test_pinned_version_does_not_resurrect_dropped_members(runner, dl, acme):
+    apply(runner, "0006_drop", {"op": "drop_member", "member": "order_items.max_price"})
+    with pytest.raises(ModelError, match="unknown or not permitted"):
+        dl.query({"measures": ["order_items.max_price"], "model_version": 5}, acme)
+
+
+def test_pinned_version_still_restores_old_definitions_through_renames(runner, dl, acme):
+    before = dl.query({"measures": ["order_items.revenue"]}, acme)["rows"][0]["order_items__revenue"]
+    apply(runner, "0006_net", {"op": "change_sql", "member": "order_items.revenue", "sql": "price - freight_value"})
+    apply(runner, "0007_ren", {"op": "rename_member", "member": "order_items.revenue", "to": "item_revenue"})
+    pinned = dl.query({"measures": ["order_items.item_revenue"], "model_version": 5}, acme)["rows"][0]
+    assert pinned["order_items__item_revenue"] == before

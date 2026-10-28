@@ -28,7 +28,44 @@ def parse_expr(sql: str, dialect: str) -> exp.Expression:
         raise ModelError(f"cannot parse SQL {sql!r}: {e.errors[0]['description'] if e.errors else e}") from None
     if isinstance(parsed, (exp.Query, exp.Command)) or parsed is None:
         raise ModelError(f"expected a SQL expression, got a statement: {sql!r}")
+    check_scalar_sql(parsed, sql)
     return parsed
+
+
+# Functions that read files, the network, the environment or other databases. Never allowed in
+# model SQL (members, filters, segments, joins) or raw SQL. (Red-team issues #5, #6.)
+FORBIDDEN_FUNCS = {
+    "read_csv", "read_csv_auto", "read_parquet", "read_json", "read_json_auto", "read_ndjson", "read_text", "read_blob",
+    "glob", "getenv", "current_setting", "query", "query_table", "sniff_csv", "pg_read_file", "pg_read_binary_file",
+    "pg_ls_dir", "pg_stat_file", "lo_import", "lo_export", "dblink", "external_query", "url", "file", "s3", "remote",
+    "mysql", "postgresql", "postgres_scan", "sqlite_scan", "iceberg_scan", "delta_scan", "parquet_scan", "load_file",
+}
+
+
+def func_name(node: exp.Func) -> str:
+    return (node.name if isinstance(node, exp.Anonymous) else node.sql_name()).lower()
+
+
+def forbidden_function(node: exp.Expression) -> str | None:
+    if isinstance(node, exp.ReadCSV):
+        return "read_csv"
+    if isinstance(node, exp.Func):
+        name = func_name(node)
+        if name in FORBIDDEN_FUNCS or name.startswith(("read_", "pg_", "lo_")) or name.endswith("_scan"):
+            return name
+    return None
+
+
+def check_scalar_sql(tree: exp.Expression, sql: str) -> None:
+    """Model SQL is a scalar expression over one cube's columns: no subqueries, no table
+    references, no file/network functions. Otherwise a new member could read another table or
+    cube and side-step its grants and row policies."""
+    for node in tree.walk():
+        if isinstance(node, (exp.Query, exp.Subquery, exp.Table, exp.Exists)):
+            raise ModelError(f"model SQL may not contain subqueries or table references: {sql!r}", "invalid_sql")
+        bad = forbidden_function(node)
+        if bad:
+            raise ModelError(f"model SQL may not call {bad}: {sql!r}", "invalid_sql")
 
 
 def ref_name(col: exp.Column) -> str | None:

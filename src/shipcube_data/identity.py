@@ -60,7 +60,10 @@ class Caller(BaseModel):
 
     def has_scope(self, scope: str) -> bool:
         # Console sessions and app requests are bounded by role and IAP instead of token scopes.
-        return self.via != "mcp" or scope in self.scopes
+        if self.via != "mcp":
+            return True
+        # data:migrate is security's name for the propose scope; data:write is the old alias.
+        return scope in self.scopes or (scope == "data:migrate" and "data:write" in self.scopes)
 
     def at_least(self, role: WorkspaceRole) -> bool:
         return self.membership_role is not None and ROLE_ORDER.index(self.membership_role) >= ROLE_ORDER.index(role)

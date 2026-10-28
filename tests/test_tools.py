@@ -25,7 +25,7 @@ def tools(runner, warehouse):
     return DataTools(lambda ws: layer)
 
 
-def agent(role="developer", scopes=("data:read", "data:write"), email="ana@acme.test"):
+def agent(role="developer", scopes=("data:read", "data:migrate"), email="ana@acme.test"):
     return Caller(workspace_id=WS, via="mcp", email=email, user_id=ANA, membership_role=role,
                   token_id=TOKEN, scopes=list(scopes))
 
@@ -38,7 +38,7 @@ def test_specs_are_json_schemas(tools):
     specs = {s["name"]: s for s in tools.specs()}
     assert set(specs) == {"data_list_cubes", "data_describe_cube", "data_query", "data_search_values", "data_propose_migration"}
     json.dumps(specs)  # serialisable as-is
-    assert specs["data_query"]["scope"] == "data:read" and specs["data_propose_migration"]["scope"] == "data:write"
+    assert specs["data_query"]["scope"] == "data:read" and specs["data_propose_migration"]["scope"] == "data:migrate"
     ops = specs["data_propose_migration"]["inputSchema"]["properties"]["ops"]["anyOf"][0]
     assert "add_measure" in ops["items"]["discriminator"]["mapping"]
     assert "measures" in json.dumps(specs["data_query"]["inputSchema"])
@@ -148,15 +148,21 @@ def test_propose_approve_apply(tools, runner):
             tools.approve(mid, who)
         with pytest.raises(ToolError, match="not with a token"):
             tools.apply(mid, who)
-    # The token's owner may approve their agent's proposal from the console: different principal.
-    tools.approve(mid, ana)
+    # Red-team #6: the token's owner is the same person, so they cannot approve their agent's proposal.
+    with pytest.raises(ToolError, match="someone other than the person"):
+        tools.approve(mid, ana.model_copy(update={"membership_role": "admin"}))
+    # A new measure can expose data, so another developer is not enough either; an admin is.
+    with pytest.raises(ToolError, match="admin role: it can expose more data"):
+        tools.approve(mid, console(role="developer"))
+    tools.approve(mid, console(role="admin"))
     applied = tools.apply(mid, ana)
     assert applied["status"] == "applied" and applied["version"] == 6
 
     log = runner.catalog.audit_log()
     propose, approve, apply_ = [r for r in log if r["target_id"] == mid]
     assert (propose["actor_type"], propose["actor_token_id"]) == ("token", str(TOKEN))
-    assert (approve["actor_type"], approve["actor_user_id"]) == ("user", str(ANA))
+    assert (approve["actor_type"], approve["actor_user_id"]) == ("user", str(BOB))
+    assert runner.catalog.migration(mid)["proposed_by_user"] == str(ANA)
     assert apply_["workspace_id"] == str(WS)
 
 
@@ -175,3 +181,32 @@ def test_breaking_changes_need_an_admin_and_no_breaks(tools, runner):
     with pytest.raises(ToolError, match="needs admin"):
         tools.apply(out["id"], console(role="developer"), allow_breaking=True)
     assert tools.apply(out["id"], console(role="admin"), allow_breaking=True)["status"] == "applied"
+
+
+def test_metadata_only_changes_can_be_approved_by_a_developer(tools):
+    out = tools.call("data_propose_migration", {"description": "Describe orders",
+                                                "ops": [{"op": "set_meta", "target": "orders", "description": "One row per order"}]}, agent())
+    assert out["kind"] == "additive" and out["widens_exposure"] == []
+    tools.approve(out["id"], console(role="developer"))  # BOB, not the proposer
+
+
+@pytest.mark.parametrize("sql,error", [
+    ("(SELECT max(freight_value) FROM order_items)", "got a statement|subqueries"),
+    ("1 + (SELECT max(freight_value) FROM order_items)", "subqueries or table references"),
+    ("EXISTS (SELECT 1 FROM tenant_globex.customers)", "subqueries or table references"),
+    ("read_text('/proc/self/environ')", "may not call read_text"),
+    ("getenv('META_API_KEY')", "may not call getenv"),
+])
+def test_member_sql_cannot_reach_other_tables_or_the_host(tools, sql, error):
+    with pytest.raises(ToolError, match=error):
+        tools.call("data_propose_migration", {"description": "Sneaky", "ops": [{"op": "add_dimension", "name": "orders.x", "sql": sql}]}, agent())
+
+
+def test_old_data_write_scope_still_proposes(tools):
+    out = tools.call("data_propose_migration", {"description": "Describe orders",
+                                                "ops": [{"op": "set_meta", "target": "orders", "description": "x"}]},
+                     agent(scopes=["data:read", "data:write"]))
+    assert out["status"] == "proposed"
+    with pytest.raises(ToolError, match="data:migrate"):
+        tools.call("data_propose_migration", {"description": "x y", "ops": [{"op": "set_meta", "target": "orders", "description": "x"}]},
+                   agent(scopes=["data:read"]))

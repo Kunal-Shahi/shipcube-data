@@ -31,7 +31,8 @@ from .drafting import DraftProvider, MuseDrafter
 from .engine import DataLayer
 from .identity import Caller, security_context
 from .model import ModelError
-from .ops import OP_ADAPTER
+from .catalog import _loads
+from .ops import OP_ADAPTER, Migration
 from .query import Query
 
 MAX_ROWS = 500
@@ -111,7 +112,7 @@ TOOLS = [
           "mode=sql compiles without running. Read `warnings`: renamed or deprecated members and full scans."),
     _Tool("search_values", "data:read", SearchArgs,
           "Distinct values of a dimension containing `text`, to get the exact spelling before filtering on it."),
-    _Tool("propose_migration", "data:write", ProposeArgs,
+    _Tool("propose_migration", "data:migrate", ProposeArgs,
           "Propose a model change, as explicit ops or drafted from a plain-English `request` and/or app `code` "
           "(Muse Spark drafts; rules are the fallback). Validates, dry-runs and returns a summary, the diff, the impact "
           "on saved queries and apps, and an approval_url. Never changes the model: a person approves and applies it "
@@ -213,7 +214,8 @@ class DataTools:
         else:
             drafted = self.drafter.draft(layer.catalog.load(), layer.dialect, a.request or "", a.code or "")
             ops, description, explained_by, notes = drafted.ops, a.description or drafted.description, drafted.explained_by, drafted.notes
-        report = layer.runner.propose(ops, description, proposed_by=caller.principal)
+        report = layer.runner.propose(ops, description, proposed_by=caller.principal,
+                                      proposed_by_user=str(caller.user_id) if caller.user_id else None)
         return report | {
             "approval_url": self.approval_url(caller.workspace_id, report["id"]),
             "explained_by": explained_by,
@@ -243,7 +245,8 @@ class DataTools:
             raise ToolError(e.code, str(e), hint) from None
 
     def register_datasource(self, caller: Caller, name: str, kind: str, secret_ref: Optional[dict[str, Any]] = None,
-                            options: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+                            options: Optional[dict[str, Any]] = None,
+                            verified_projects: Optional[list[str]] = None) -> dict[str, Any]:
         """Connect a warehouse from a stored secret reference. Console only, workspace admins only."""
         self._require_console(caller, "connecting a warehouse")
         if not caller.at_least("admin"):
@@ -252,7 +255,7 @@ class DataTools:
         security_context(caller, layer.catalog)  # workspace check
         try:
             ds = Datasource(name=name, kind=kind, secret_ref=SecretRef(**secret_ref) if secret_ref else None, options=options or {})
-            return register_datasource(layer.catalog, ds, caller.principal)
+            return register_datasource(layer.catalog, ds, caller.principal, verified_projects)
         except ValidationError as e:
             first = e.errors()[0]
             raise ToolError("invalid_arguments", f"{'.'.join(map(str, first['loc']))}: {first['msg']}") from None
@@ -266,10 +269,13 @@ class DataTools:
         rec = layer.catalog.migration(migration_id)
         if rec is None:
             raise ToolError("not_found", f"unknown migration {migration_id}")
-        if not (caller.at_least("admin") or (rec["kind"] == "additive" and caller.at_least("developer"))):
-            raise ToolError("forbidden", f"approving a {rec['kind']} migration needs the admin role")
+        widens = Migration.model_validate({"id": rec["id"], "ops": _loads(rec["ops"])}).widens_exposure()
+        if not caller.at_least("admin"):
+            if not caller.at_least("developer") or rec["kind"] != "additive" or widens:
+                why = f"it can expose more data ({', '.join(sorted(set(widens)))})" if widens else f"it is a {rec['kind']} migration"
+                raise ToolError("forbidden", f"approving this needs the admin role: {why}")
         try:
-            layer.runner.approve(migration_id, caller.principal)
+            layer.runner.approve(migration_id, caller.principal, str(caller.user_id) if caller.user_id else None)
         except ModelError as e:
             raise ToolError(e.code, str(e), e.hint) from None
         return {"id": migration_id, "status": "approved", "approved_by": caller.principal}
