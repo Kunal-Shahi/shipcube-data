@@ -218,9 +218,12 @@ RecordSecret = Callable[..., str]
 
 def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools] = None,
                 secret_store: Optional[SecretStore] = None, record_secret: Optional[RecordSecret] = None,
-                verified_projects: Callable[[str], list[str]] = lambda ws: [],
+                verified_projects: Callable[[Any], list[str]] = lambda caller: [],
                 principal_names: PrincipalNames = default_names) -> APIRouter:
     """Routes for the console's Data page. Mount under /v1/data.
+
+    `verified_projects(raw_caller)` returns the workspace's verified GCP project ids. It gets the API's
+    own caller so it can read them under that caller's row-level security (e.g. workspace.verified_projects).
 
     Without `secret_store` and `record_secret`, PUT /warehouse answers 501 (nothing else needs them)."""
     router = APIRouter(tags=["data"])
@@ -296,9 +299,9 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         if not c.at_least("admin"):
             raise http_error("forbidden", "connecting a warehouse needs the admin role")
 
-    def candidate(c: Caller, body: WarehouseInput) -> tuple[Datasource, str]:
+    def candidate(raw: Any, body: WarehouseInput) -> tuple[Datasource, str]:
         if isinstance(body, BigQueryInput):
-            if body.project not in set(verified_projects(str(c.workspace_id))):
+            if body.project not in set(verified_projects(raw)):
                 raise http_error("forbidden", f"project {body.project!r} is not a verified GCP project of this workspace; link it first")
             return Datasource(name="primary", kind="bigquery", options={"project": body.project, "location": body.location}), body.service_account_key
         if body.kind == "clickhouse":
@@ -324,9 +327,10 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         return {"tables": int(tables), "schemas": int(schemas)}
 
     @router.post("/warehouse:test")
-    def test_warehouse(body: Annotated[WarehouseInput, Field(discriminator="kind")], c: Caller = Depends(person)) -> dict[str, Any]:
+    def test_warehouse(body: Annotated[WarehouseInput, Field(discriminator="kind")], c: Caller = Depends(person),
+                       raw: Any = Depends(caller_dependency)) -> dict[str, Any]:
         admin_person(c)
-        ds, secret = candidate(c, body)
+        ds, secret = candidate(raw, body)
         out = probe(ds, secret)
         log_event("data.warehouse.test", workspace_id=str(c.workspace_id), kind=ds.kind, **out)
         return out
@@ -336,7 +340,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
                       raw: Any = Depends(caller_dependency)) -> dict[str, Any]:  # raw: the API's caller, for record_secret's RLS
         admin_person(c)
         _, layer, _ = layer_ctx(c)
-        ds, secret = candidate(c, body)
+        ds, secret = candidate(raw, body)
         out = probe(ds, secret)  # never store credentials that don't work
         if secret_store is None or record_secret is None:
             raise http_error("data_unavailable", "saving warehouse credentials needs the API's secret store")
@@ -349,7 +353,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
                                    fingerprint=hashlib.sha256(secret.encode()).digest())
             ref = SecretRef(id=str(ref_id), resource_name=resource, version=str(version))
             guard(lambda: register_datasource(layer.catalog, ds.model_copy(update={"secret_ref": ref}), c.principal,
-                                              verified_projects(str(c.workspace_id))))
+                                              verified_projects(raw)))
         except BaseException:
             secret_store.destroy(resource, version)  # never leave an unreferenced credential behind
             raise

@@ -205,3 +205,28 @@ def test_put_warehouse_without_the_api_secret_store_is_501(tmp_path, monkeypatch
         assert client.post("/v1/data/warehouse:test", json=body).json() == {"tables": 3, "schemas": 1}
         r = client.put("/v1/data/warehouse", json=body)
     assert r.status_code == 501 and r.json()["detail"]["code"] == "data_unavailable"
+
+
+def test_verified_projects_hook_gets_the_api_caller(tmp_path, monkeypatch):
+    for k, v in {"SHIPCUBE_DEV_MODE": "1", "SHIPCUBE_DATA_CATALOG_URL": str(tmp_path / "c.db"), "SHIPCUBE_DATA_WORKSPACE": str(WS),
+                 "SHIPCUBE_DATA_DUCKDB_PATH": str(tmp_path / "olist.duckdb")}.items():
+        monkeypatch.setenv(k, v)
+    local.seed(local.Settings.from_env())
+    seen = []
+
+    class ApiCaller:  # shaped like shipcube_api.auth.Caller
+        token_id, user_id, workspace_id, scopes, via, email, role = None, str(CARL), str(WS), frozenset(), "console", "carl@example.com", "admin"
+
+    api_caller = ApiCaller()
+
+    def verified(caller):
+        seen.append(caller)
+        return ["acme-data"]
+
+    app = FastAPI()
+    app.include_router(data_router(caller_dependency=lambda: api_caller, tools=local.tools_from_env(), verified_projects=verified),
+                       prefix="/v1/data")
+    with TestClient(app) as client:
+        r = client.post("/v1/data/warehouse:test", json={"kind": "bigquery", "project": "other", "location": "US", "service_account_key": "{}"})
+    assert r.status_code == 403 and "not a verified GCP project" in r.json()["detail"]["message"]
+    assert seen == [api_caller]

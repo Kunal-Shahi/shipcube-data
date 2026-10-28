@@ -7,7 +7,7 @@ from shipcube_data.http import data_router
 
 app.include_router(
     data_router(caller_dependency=caller, secret_store=secret_store(), record_secret=record_secret,
-                verified_projects=verified_gcp_projects),
+                verified_projects=workspace.verified_projects),
     prefix="/v1/data",
 )
 ```
@@ -16,6 +16,7 @@ Arguments:
 
 - **`caller_dependency`** is the API's own dependency for the verified caller. The router reads its attributes: `user_id`, `workspace_id`, `email`, `role`, `token_id`, `scopes` and `via`.
 - **`secret_store`** is the API's secret store: `put(secret_id, value, labels) -> (resource_name, version)` and `destroy(resource_name, version)`. That's Secret Manager in production, or the DEV_MODE JSON file security's emulator serves.
+- **`verified_projects(raw_caller) -> list[str]`** returns the workspace's verified GCP project ids, read under the caller's row-level security. In the API this is `workspace.verified_projects`. A BigQuery warehouse must use one of them.
 - **`record_secret(raw_caller, kind, label, resource_name, version, last4, fingerprint) -> secret_refs.id`** writes the reference into the API's `secret_refs` table, inside the caller's RLS-scoped transaction. This package never opens the API's database or a Secret Manager client of its own. Without these two arguments, `PUT /warehouse` answers 501.
 
 Configuration comes from the same environment as the MCP tools (`SHIPCUBE_DATA_CATALOG_URL`, …; see [LOCAL.md](LOCAL.md)). Install with the `http` extra. When the package isn't installed, the API answers these routes with 501 `data_unavailable`.
