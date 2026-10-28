@@ -224,7 +224,7 @@ class DataTools:
             drafted = self.drafter.draft(layer.catalog.load(), layer.dialect, a.request or "", a.code or "")
             ops, description, explained_by, notes = drafted.ops, a.description or drafted.description, drafted.explained_by, drafted.notes
         report = layer.runner.propose(ops, description, proposed_by=caller.principal,
-                                      proposed_by_user=str(caller.user_id) if caller.user_id else None)
+                                      proposed_by_user=str(caller.user_id) if caller.user_id else None, drafted_by=explained_by)
         return report | {
             "approval_url": self.approval_url(caller.workspace_id, report["id"]),
             "explained_by": explained_by,

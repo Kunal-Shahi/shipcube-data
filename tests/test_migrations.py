@@ -233,11 +233,11 @@ def test_catalog_schema_migrations_are_versioned(tmp_path):
     with pytest.raises(ModelError) as e:
         Catalog(url, migrate=False)
     assert e.value.code == "catalog_not_migrated"
-    assert Db(url).migrate_schema() == ["0001_initial.sql", "0002_migration_humans.sql"]
+    assert Db(url).migrate_schema() == ["0001_initial.sql", "0002_migration_humans.sql", "0003_migration_decisions.sql"]
     assert Db(url).migrate_schema() == []  # idempotent
     cat = Catalog(url, migrate=False)
     assert [r["name"] for r in cat.db.execute("SELECT name FROM catalog_schema_migrations ORDER BY version")] == [
-        "0001_initial.sql", "0002_migration_humans.sql"]
+        "0001_initial.sql", "0002_migration_humans.sql", "0003_migration_decisions.sql"]
     cat.db.execute("UPDATE catalog_schema_migrations SET checksum = 'edited'")
     with pytest.raises(ModelError, match="changed after it was applied"):
         Db(url).migrate_schema()

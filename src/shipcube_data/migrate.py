@@ -174,7 +174,7 @@ class Runner:
                 ops=json.dumps([op.model_dump(mode="json", by_alias=True, exclude_defaults=True) for op in m.ops]),
                 touches=json.dumps(sorted(report["_touched"])), kind=m.kind(), status="applied",
                 base_version=report["base_version"], version=version,
-                impact=json.dumps(report.get("impact")), applied_at=_now(),
+                impact=json.dumps(report.get("impact")), diff=json.dumps(report.get("diff")), applied_at=_now(),
             )
             cat.audit("apply", actor, m.id, version, diff=diff)
         log_event("migration.applied", migration_id=m.id, version=version, kind=m.kind(), actor=actor,
@@ -215,7 +215,8 @@ class Runner:
     # ------------------------------------------------------------ agent proposals
 
     def propose(self, ops: list[dict[str, Any]], description: str, proposed_by: str,
-                migration_id: Optional[str] = None, proposed_by_user: Optional[str] = None) -> dict[str, Any]:
+                migration_id: Optional[str] = None, proposed_by_user: Optional[str] = None,
+                drafted_by: Optional[str] = None) -> dict[str, Any]:
         """Validate, dry-run and store a migration for a human to approve. Never applies it."""
         with self.catalog.transaction() as cat:  # the lock also makes id allocation race-free
             mid = migration_id or self._next_id(description)
@@ -225,8 +226,8 @@ class Runner:
                 id=m.id, description=description, checksum=m.checksum(),
                 ops=json.dumps([op.model_dump(mode="json", by_alias=True, exclude_defaults=True) for op in m.ops]),
                 touches=json.dumps(report["touches"]), kind=m.kind(), status="proposed",
-                base_version=m.base_version, proposed_by=proposed_by, proposed_by_user=proposed_by_user,
-                impact=json.dumps(report["impact"]),
+                base_version=m.base_version, proposed_by=proposed_by, proposed_by_user=proposed_by_user, drafted_by=drafted_by,
+                impact=json.dumps(report["impact"]), diff=json.dumps(report["diff"]),
             )
             cat.audit("propose", proposed_by, m.id, kind=m.kind())
         log_event("migration.proposed", migration_id=m.id, kind=m.kind(), actor=proposed_by,
@@ -244,15 +245,16 @@ class Runner:
             same_person = bool(approver_user) and approver_user == rec.get("proposed_by_user")
             if same_principal or same_person:
                 raise MigrationError("a proposal must be approved by someone other than the person who proposed it", "forbidden")
-            cat.upsert_migration(id=mid, status="approved", approved_by=approver, approved_by_user=approver_user)
+            cat.upsert_migration(id=mid, status="approved", approved_by=approver, approved_by_user=approver_user, decided_at=_now())
             cat.audit("approve", approver, mid)
 
-    def reject(self, mid: str, approver: str, reason: str = "") -> None:
+    def reject(self, mid: str, approver: str, reason: str = "", approver_user: Optional[str] = None) -> None:
         with self.catalog.transaction() as cat:
             rec = cat.migration(mid)
             if not rec or rec["status"] not in {"proposed", "approved"}:
                 raise MigrationError(f"{mid} is not a pending proposal", "not_found")
-            cat.upsert_migration(id=mid, status="rejected", approved_by=approver)
+            cat.upsert_migration(id=mid, status="rejected", approved_by=approver, approved_by_user=approver_user,
+                                 decision_note=reason or None, decided_at=_now())
             cat.audit("reject", approver, mid, reason=reason)
 
     def stored(self, mid: str) -> Migration:
