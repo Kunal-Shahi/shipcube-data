@@ -162,17 +162,28 @@ def tools_from_env(**kwargs: Any) -> DataTools:
     if not url:
         raise ModelError("SHIPCUBE_DATA_CATALOG_URL is not set", "invalid")
     resolver = resolver_from_env()
-    local = threading.local()
+    cache: dict[tuple[int, str], DataLayer] = {}  # (thread, workspace): connections are per thread
+    lock = threading.Lock()
 
     def layer_for(workspace_id: uuid.UUID) -> DataLayer:
-        cache = local.__dict__.setdefault("layers", {})
-        key = str(workspace_id)
-        if key not in cache:
-            cat = Catalog(url, workspace_id=key, migrate=False)
-            cache[key] = DataLayer.from_catalog(cat, resolver)
-        return cache[key]
+        key = (threading.get_ident(), str(workspace_id))
+        with lock:
+            layer = cache.get(key)
+        if layer is None:
+            layer = DataLayer.from_catalog(Catalog(url, workspace_id=key[1], migrate=False), resolver)
+            with lock:
+                cache[key] = layer
+        return layer
 
-    return DataTools(layer_for, **kwargs)
+    def forget(workspace_id: uuid.UUID) -> None:
+        """Drop every thread's cached layer for a workspace (e.g. after its warehouse credentials change)."""
+        with lock:  # don't close them: another thread may be mid-request; they're released when unreferenced
+            for k in [k for k in cache if k[1] == str(workspace_id)]:
+                del cache[k]
+
+    tools = DataTools(layer_for, **kwargs)
+    tools.forget_workspace = forget  # type: ignore[attr-defined]
+    return tools
 
 
 # ---------------------------------------------------------------- smoke

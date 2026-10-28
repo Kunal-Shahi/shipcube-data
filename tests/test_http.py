@@ -230,3 +230,38 @@ def test_verified_projects_hook_gets_the_api_caller(tmp_path, monkeypatch):
         r = client.post("/v1/data/warehouse:test", json={"kind": "bigquery", "project": "other", "location": "US", "service_account_key": "{}"})
     assert r.status_code == 403 and "not a verified GCP project" in r.json()["detail"]["message"]
     assert seen == [api_caller]
+
+
+def test_rotating_warehouse_credentials_destroys_the_old_version(tmp_path, monkeypatch):
+    """PUT twice: the second credential replaces the first, and the first is destroyed in the API's store."""
+    from shipcube_data import datasources
+    from shipcube_data.catalog import Catalog
+    from shipcube_data.engine import DataLayer
+    from shipcube_data.tools import DataTools
+    from shipcube_data.warehouses import ExecResult
+
+    monkeypatch.setenv("SHIPCUBE_DEV_MODE", "1")
+    monkeypatch.setenv("SHIPCUBE_DATA_ALLOWED_DB_HOSTS", "wh.internal")
+    monkeypatch.setitem(datasources.DEFAULT_CONNECTORS, "postgres",
+                        lambda ds, secret: (lambda sql, limits, qid: ExecResult(["t", "s"], [(1, 1)])))
+    cat = Catalog(tmp_path / "c.db", workspace_id=str(WS))  # an empty model: any warehouse kind may be connected
+    store, destroyed, recorded = FakeStore(), [], []
+    original_destroy = store.destroy
+
+    def destroy(resource, version):
+        destroyed.append(resource)
+        original_destroy(resource, version)
+
+    store.destroy = destroy
+    tools = DataTools(lambda ws: DataLayer.from_catalog(cat, lambda ref: store.live[ref.resource_name]))
+    app = FastAPI()
+    app.include_router(data_router(caller_dependency=lambda: CALLERS["carl-admin"], tools=tools, secret_store=store,
+                                   record_secret=lambda raw, **ref: recorded.append(ref) or str(uuid.uuid4())), prefix="/v1/data")
+    body = {"kind": "postgres", "host": "wh.internal", "port": 5432, "database": "w", "user": "r", "ssl": "disable"}
+    with TestClient(app) as client:
+        assert client.put("/v1/data/warehouse", json={**body, "password": "first-pw"}).status_code == 200
+        first = recorded[0]["resource_name"]
+        assert client.put("/v1/data/warehouse", json={**body, "password": "second-pw"}).status_code == 200
+    second = recorded[1]["resource_name"]
+    assert first != second and destroyed == [first] and list(store.live) == [second]
+    assert store.live[second] == "second-pw"

@@ -65,3 +65,13 @@ def test_tools_refuse_unseeded_workspaces(dev, tmp_path):
     with pytest.raises(ToolError) as e:
         tools.call("data_list_cubes", {}, caller)
     assert e.value.code in {"catalog_not_migrated", "no_datasource"}
+
+
+def test_forget_workspace_drops_only_that_workspaces_layers(dev, tmp_path):
+    dev.setenv("SHIPCUBE_DATA_CATALOG_URL", str(tmp_path / "c.db"))
+    tools = local.tools_from_env()
+    a, b = uuid.uuid4(), uuid.uuid4()
+    la, lb = tools.layer_for(a), tools.layer_for(b)
+    assert tools.layer_for(a) is la
+    tools.forget_workspace(a)
+    assert tools.layer_for(a) is not la and tools.layer_for(b) is lb

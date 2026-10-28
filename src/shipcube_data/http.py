@@ -359,7 +359,9 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
             raise
         if old and old["secret_resource"] and old["secret_resource"] != resource:
             secret_store.destroy(old["secret_resource"], old["secret_version"])
-        state["tools"] = None  # reconnect with the new credentials
+        forget = getattr(get_tools(), "forget_workspace", None)
+        if forget:  # this workspace's next query reconnects with the new credentials; other workspaces are untouched
+            forget(c.workspace_id)
         return {**out, "warehouse": get_warehouse(c)}
 
     # ---- cubes
