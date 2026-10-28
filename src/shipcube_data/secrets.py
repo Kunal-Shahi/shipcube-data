@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import Callable
+from typing import Callable, Optional
 
 from .datasources import LOCAL_SECRET_PROJECT, SecretRef, dev_mode, local_secret_resolver
 from .model import ModelError
@@ -39,18 +39,19 @@ def gcp_secret_resolver(timeout_s: float = 10.0) -> Callable[[SecretRef], str]:
 
 
 def resolver_from_env() -> Callable[[SecretRef], str]:
-    """Local secrets in DEV_MODE; Secret Manager otherwise (local refs are still refused outside DEV_MODE)."""
-    if dev_mode():
-        gcp = None
+    """Local secrets in DEV_MODE; Secret Manager otherwise (local refs are still refused outside DEV_MODE).
 
-        def resolve(ref: SecretRef) -> str:
-            nonlocal gcp
-            if ref.resource_name.startswith(f"projects/{LOCAL_SECRET_PROJECT}/"):
-                return local_secret_resolver(ref)
-            gcp = gcp or gcp_secret_resolver()
-            return gcp(ref)
-
-        return resolve
-    if os.environ.get("SHIPCUBE_DATA_SECRET_PROJECT") is None:
+    Lazy: credentials are looked up on the first secret, not when the tools are built at import time."""
+    dev = dev_mode()
+    if not dev and os.environ.get("SHIPCUBE_DATA_SECRET_PROJECT") is None:
         log_event("secret.unconfigured", level=30, detail="SHIPCUBE_DATA_SECRET_PROJECT is not set; warehouses with secrets will be refused")
-    return gcp_secret_resolver()
+    gcp: Optional[Callable[[SecretRef], str]] = None
+
+    def resolve(ref: SecretRef) -> str:
+        nonlocal gcp
+        if dev and ref.resource_name.startswith(f"projects/{LOCAL_SECRET_PROJECT}/"):
+            return local_secret_resolver(ref)
+        gcp = gcp or gcp_secret_resolver()
+        return gcp(ref)
+
+    return resolve
