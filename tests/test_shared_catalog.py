@@ -145,6 +145,7 @@ def test_migration_role_without_create_on_the_database(tmp_path):
         c.execute(f"CREATE ROLE {migrator} LOGIN")
         c.execute(f"GRANT {owner} TO {migrator}")
         c.execute(f"ALTER ROLE {migrator} SET role = '{owner}'")
+        c.execute("DO $$ BEGIN CREATE ROLE shipcube_app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$")
     admin_url, migrator_url = f"{base}/{dbname}", f"{base.rsplit('@', 1)[0].rsplit('//', 1)[0]}//{migrator}@{base.rsplit('@', 1)[1]}/{dbname}"
     try:
         with psycopg.connect(admin_url, autocommit=True) as c:  # bootstrap.sql's part, as the administrator
@@ -158,11 +159,18 @@ def test_migration_role_without_create_on_the_database(tmp_path):
         with psycopg.connect(admin_url, autocommit=True) as c:
             c.execute("CREATE SCHEMA catalog")
             c.execute(f"GRANT USAGE, CREATE ON SCHEMA catalog TO {owner}")
-        assert migrate_shared_catalog(migrator_url) == ["0001_catalog.sql"]
+        assert migrate_shared_catalog(migrator_url) == ["0001_catalog.sql", "0002_ledger_read_only.sql"]
         assert migrate_shared_catalog(migrator_url) == []  # idempotent
         with psycopg.connect(admin_url) as c:
             owners = {r[0] for r in c.execute("SELECT tableowner FROM pg_tables WHERE schemaname = 'catalog'")}
+            privs = dict(c.execute(
+                "SELECT t, has_table_privilege('shipcube_app', t, 'SELECT') AND NOT "
+                "(has_table_privilege('shipcube_app', t, 'INSERT') OR has_table_privilege('shipcube_app', t, 'UPDATE') "
+                "OR has_table_privilege('shipcube_app', t, 'DELETE') OR has_table_privilege('shipcube_app', t, 'TRUNCATE')) "
+                "FROM unnest(ARRAY['catalog.catalog_schema_migrations', 'catalog.settings']) t").fetchall())
         assert owners == {owner}
+        # The service roles read the ledger but can't write it; catalog tables stay writable.
+        assert privs == {"catalog.catalog_schema_migrations": True, "catalog.settings": False}
     finally:
         with psycopg.connect(PG_URL, autocommit=True) as c:
             c.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
