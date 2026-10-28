@@ -4,10 +4,15 @@
     app.include_router(data_router(caller_dependency=caller), prefix="/v1/data")
 
 `caller_dependency` is the API's own FastAPI dependency for the verified caller (its
-`auth.Caller`: user_id, workspace_id, email, role, token_id, scopes, via). Response bodies are
-the console's types in `apps/web/src/lib/types.ts` (Warehouse, Cube, Migration), so the console
-passes them through. Errors are `HTTPException(status, {code, message, hint})`, which the API's
-handler wraps as `{"error": {...}}`.
+`auth.Caller`: user_id, workspace_id, email, role, token_id, scopes, via). Bodies are snake_case
+like every other /v1 route; the console maps them to its types (Warehouse, Cube, Migration in
+`apps/web/src/lib/types.ts`). Errors are `HTTPException(status, {code, message, hint})`, which the
+API's handler wraps as `{"error": {...}}`.
+
+Credentials (PUT /warehouse) go through the API's own `secret_store` (`put(secret_id, value,
+labels) -> (resource_name, version)`, `destroy(resource_name, version)`), and the API records the
+reference in its `secret_refs` table through `record_secret`. This module never talks to Secret
+Manager itself.
 
 Scoping: every request opens the caller's own workspace catalog (a Postgres schema per
 workspace). Reads need `data:read` on a PAT. Changing the model or the warehouse needs a
@@ -16,11 +21,12 @@ person's console session: agents only ever propose.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated, Any, Callable, Literal, Optional, Union
+from typing import Annotated, Any, Callable, Literal, Optional, Protocol, Union
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,7 +43,7 @@ STATUS = {
     "forbidden": 403, "permission_denied": 403, "not_found": 404, "unknown_cube": 404, "catalog_not_migrated": 404,
     "no_datasource": 404, "tenant_not_provisioned": 404, "conflict": 409, "needs_approval": 409, "would_break": 409,
     "checksum_mismatch": 409, "invalid": 400, "invalid_arguments": 400, "invalid_op": 400, "invalid_sql": 400,
-    "warehouse_unavailable": 503, "query_timeout": 504, "internal_error": 500,
+    "warehouse_unavailable": 503, "query_timeout": 504, "internal_error": 500, "data_unavailable": 501,
 }
 API_CODE = {"forbidden": "permission_denied", "invalid": "invalid_argument", "invalid_arguments": "invalid_argument"}
 
@@ -75,10 +81,10 @@ def _is_uuid(v: Any) -> bool:
 def default_names(principal: Optional[str], user_id: Optional[str]) -> dict[str, str]:
     kind, _, ident = (principal or "system").partition(":")
     if kind == "token":
-        return {"agent": "MCP agent", "tokenName": f"token {ident[:8]}", "user": user_id or "unknown"}
+        return {"agent": "MCP agent", "token_name": f"token {ident[:8]}", "user": user_id or "unknown"}
     if kind == "user":
-        return {"agent": "Console", "tokenName": "console session", "user": user_id or ident}
-    return {"agent": "ShipCube", "tokenName": "system", "user": principal or "system"}
+        return {"agent": "Console", "token_name": "console session", "user": user_id or ident}
+    return {"agent": "ShipCube", "token_name": "system", "user": principal or "system"}
 
 
 # ---------------------------------------------------------------- serializers (console shapes)
@@ -89,24 +95,24 @@ def _iso(v: Any) -> Optional[str]:
     return v.isoformat() if isinstance(v, datetime) else str(v)
 
 
-def _camel_impact(impact: Optional[dict[str, Any]]) -> dict[str, Any]:
+def _impact(impact: Optional[dict[str, Any]]) -> dict[str, Any]:
     impact = impact or {}
     return {"breaks": impact.get("breaks", []), "changes": impact.get("changes", []), "warnings": impact.get("warnings", []),
-            "unaffected": impact.get("unaffected", 0), "appsBroken": impact.get("apps_broken", [])}
+            "unaffected": impact.get("unaffected", 0), "apps_broken": impact.get("apps_broken", [])}
 
 
 def migration_body(rec: dict[str, Any], catalog, names: PrincipalNames) -> dict[str, Any]:
     raw = rec["status"]
     status = {"proposed": "proposed", "approved": "proposed", "applied": "applied"}.get(raw, "rejected")
     body: dict[str, Any] = {
-        "id": rec["id"], "description": rec["description"], "status": status, "rawStatus": raw, "kind": rec["kind"],
-        "proposedBy": names(rec.get("proposed_by"), rec.get("proposed_by_user")),
-        "proposedAt": _iso(rec["created_at"]), "baseVersion": rec.get("base_version") or 0,
+        "id": rec["id"], "description": rec["description"], "status": status, "raw_status": raw, "kind": rec["kind"],
+        "proposed_by": names(rec.get("proposed_by"), rec.get("proposed_by_user")),
+        "proposed_at": _iso(rec["created_at"]), "base_version": rec.get("base_version") or 0,
         "ops": _loads(rec["ops"]) or [], "diff": _loads(rec.get("diff")) or {"added": [], "changed": [], "removed": []},
-        "impact": _camel_impact(_loads(rec.get("impact"))),
+        "impact": _impact(_loads(rec.get("impact"))),
     }
     if rec.get("drafted_by"):
-        body["draftedBy"] = rec["drafted_by"]
+        body["drafted_by"] = rec["drafted_by"]
     if raw == "approved":
         body["approved"] = {"at": _iso(rec.get("decided_at")), "by": names(rec.get("approved_by"), rec.get("approved_by_user"))["user"]}
     if raw == "applied":
@@ -137,7 +143,7 @@ def cube_body(cube, model, layer, caller: Caller, ctx, admin: bool) -> dict[str,
         if m.deprecated:
             d["deprecated"] = m.deprecated + (f"; use {m.replaced_by}" if m.replaced_by else "")
         if grants:
-            d["restrictedTo"] = list(grants)
+            d["restricted_to"] = list(grants)
         return d
 
     shown = [m for m in cube.members() if admin or comp.visible(cube, m)]
@@ -161,7 +167,7 @@ def cube_body(cube, model, layer, caller: Caller, ctx, admin: bool) -> dict[str,
         **({"partition": partition} if partition else {}),
         "policies": [f"{pol.name}" + (f" (roles: {', '.join(pol.roles)})" if pol.roles else "")
                      for pol in model.policies.values() if pol.cube == cube.name],
-        "usedBy": sorted(used),
+        "used_by": sorted(used),
     }
 
 
@@ -183,7 +189,7 @@ class BigQueryInput(BaseModel):
     kind: Literal["bigquery"]
     project: str
     location: str = "US"
-    serviceAccountKey: str = Field(repr=False)
+    service_account_key: str = Field(repr=False)
 
 
 WarehouseInput = Union[PostgresInput, BigQueryInput]
@@ -191,62 +197,32 @@ WarehouseInput = Union[PostgresInput, BigQueryInput]
 
 class DecisionBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    allowBreaking: bool = False
+    allow_breaking: bool = False
     note: Optional[str] = Field(default=None, max_length=1000)
 
 
-# ---------------------------------------------------------------- secret store (where PUT /warehouse writes)
+# ---------------------------------------------------------------- secrets (the API's store and table)
 
-class SecretStore:
-    def put(self, workspace_id: str, name: str, value: str) -> SecretRef:  # pragma: no cover - interface
-        raise NotImplementedError
+class SecretStore(Protocol):
+    """The API's secret store (shipcube_api.secret_store): Secret Manager, or the DEV_MODE JSON file."""
 
-
-class LocalSecretStore(SecretStore):
-    """DEV_MODE only: keeps the value in this process's environment, where local_secret_resolver reads it."""
-
-    def put(self, workspace_id: str, name: str, value: str) -> SecretRef:
-        if not dev_mode():
-            raise ModelError("the local secret store only works in SHIPCUBE_DEV_MODE", "forbidden")
-        import re
-
-        os.environ["SHIPCUBE_DATA_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper()] = value
-        return SecretRef(id=str(uuid.uuid4()), resource_name=f"projects/local/secrets/{name}", version="1")
+    def put(self, secret_id: str, value: str, labels: dict[str, str]) -> tuple[str, str]: ...
+    def destroy(self, resource_name: str, version: str) -> None: ...
 
 
-class GcpSecretStore(SecretStore):
-    """Secret Manager in SHIPCUBE_DATA_SECRET_PROJECT, with the runtime service account (ADC)."""
-
-    def put(self, workspace_id: str, name: str, value: str) -> SecretRef:
-        import base64
-
-        import google.auth
-        from google.auth.transport.requests import AuthorizedSession
-
-        project = os.environ.get("SHIPCUBE_DATA_SECRET_PROJECT")
-        if not project:
-            raise ModelError("SHIPCUBE_DATA_SECRET_PROJECT is not set", "invalid")
-        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        s = AuthorizedSession(creds)
-        base = f"https://secretmanager.googleapis.com/v1/projects/{project}/secrets"
-        r = s.post(f"{base}?secretId={name}", json={"replication": {"automatic": {}},
-                                                    "labels": {"shipcube_workspace": workspace_id.replace("-", "")}}, timeout=10)
-        if r.status_code not in (200, 409):
-            raise ModelError(f"cannot create the secret (HTTP {r.status_code})", "warehouse_unavailable")
-        r = s.post(f"{base}/{name}:addVersion", json={"payload": {"data": base64.b64encode(value.encode()).decode()}}, timeout=10)
-        if r.status_code != 200:
-            raise ModelError(f"cannot store the secret (HTTP {r.status_code})", "warehouse_unavailable")
-        version = r.json()["name"].rsplit("/", 1)[1]
-        return SecretRef(id=str(uuid.uuid4()), resource_name=f"projects/{project}/secrets/{name}", version=version)
+# record_secret(raw_caller, kind, label, resource_name, version, last4, fingerprint) -> secret_refs.id
+RecordSecret = Callable[..., str]
 
 
 # ---------------------------------------------------------------- router
 
 def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools] = None,
-                secret_store: Optional[SecretStore] = None,
+                secret_store: Optional[SecretStore] = None, record_secret: Optional[RecordSecret] = None,
                 verified_projects: Callable[[str], list[str]] = lambda ws: [],
                 principal_names: PrincipalNames = default_names) -> APIRouter:
-    """Routes for the console's Data page. Mount under /v1/data."""
+    """Routes for the console's Data page. Mount under /v1/data.
+
+    Without `secret_store` and `record_secret`, PUT /warehouse answers 501 (nothing else needs them)."""
     router = APIRouter(tags=["data"])
     state: dict[str, Any] = {"tools": tools}
 
@@ -260,9 +236,6 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
                 raise http_error("data_unavailable", f"the data layer is not configured: {e}") from None
         return state["tools"]
 
-    def store() -> SecretStore:
-        return secret_store or (LocalSecretStore() if dev_mode() else GcpSecretStore())
-
     def session(raw: Any = Depends(caller_dependency)) -> Caller:
         return to_caller(raw)
 
@@ -272,6 +245,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         return c
 
     def person(c: Caller = Depends(session)) -> Caller:
+        # Mirrors the API's console_session: a console login (via == "console"), never a PAT.
         if not c.is_human_session:
             raise http_error("forbidden", "only a person in the console can do this; agents can only propose")
         return c
@@ -300,7 +274,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         cat = layer.catalog
         row = cat.db.execute("SELECT * FROM datasources WHERE name = 'primary'").fetchone()
         if row is None:
-            return {"connected": False, "modelVersion": cat.head()}
+            return {"connected": False, "model_version": cat.head()}
         ds = get_datasource(cat)
         details = [{"label": k.replace("_", " ").capitalize(), "value": str(v)} for k, v in sorted(ds.options.items())
                    if k in {"host", "port", "dbname", "user", "project", "location", "impersonate_service_account"}]
@@ -315,8 +289,8 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         except ModelError as e:
             details.append({"label": "Status", "value": f"unreachable ({e.code})"})
         return {"connected": True, "kind": ds.kind, "name": ds.options.get("dbname") or ds.options.get("project") or ds.name,
-                "details": details, "connectedAt": _iso(row["created_at"]), "connectedBy": principal_names(row["created_by"], None)["user"],
-                "lastCheckedAt": checked, "modelVersion": cat.head()}
+                "details": details, "connected_at": _iso(row["created_at"]), "connected_by": principal_names(row["created_by"], None)["user"],
+                "last_checked_at": checked, "model_version": cat.head()}
 
     def admin_person(c: Caller) -> None:
         if not c.at_least("admin"):
@@ -326,7 +300,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         if isinstance(body, BigQueryInput):
             if body.project not in set(verified_projects(str(c.workspace_id))):
                 raise http_error("forbidden", f"project {body.project!r} is not a verified GCP project of this workspace; link it first")
-            return Datasource(name="primary", kind="bigquery", options={"project": body.project, "location": body.location}), body.serviceAccountKey
+            return Datasource(name="primary", kind="bigquery", options={"project": body.project, "location": body.location}), body.service_account_key
         if body.kind == "clickhouse":
             raise http_error("invalid", "ClickHouse warehouses are not supported yet")
         guard(lambda: check_db_host(body.host, body.ssl))
@@ -358,14 +332,29 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         return out
 
     @router.put("/warehouse")
-    def put_warehouse(body: Annotated[WarehouseInput, Field(discriminator="kind")], c: Caller = Depends(person)) -> dict[str, Any]:
+    def put_warehouse(body: Annotated[WarehouseInput, Field(discriminator="kind")], c: Caller = Depends(person),
+                      raw: Any = Depends(caller_dependency)) -> dict[str, Any]:  # raw: the API's caller, for record_secret's RLS
         admin_person(c)
         _, layer, _ = layer_ctx(c)
         ds, secret = candidate(c, body)
         out = probe(ds, secret)  # never store credentials that don't work
-        ref = guard(lambda: store().put(str(c.workspace_id), f"ws-{c.workspace_id}-warehouse-{uuid.uuid4().hex[:8]}", secret))
-        guard(lambda: register_datasource(layer.catalog, ds.model_copy(update={"secret_ref": ref}), c.principal,
-                                          verified_projects(str(c.workspace_id))))
+        if secret_store is None or record_secret is None:
+            raise http_error("data_unavailable", "saving warehouse credentials needs the API's secret store")
+        old = layer.catalog.db.execute("SELECT secret_resource, secret_version FROM datasources WHERE name = 'primary'").fetchone()
+        secret_id = f"ws-{c.workspace_id}-warehouse_credential-{uuid.uuid4()}"
+        resource, version = secret_store.put(secret_id, secret, {"workspace": str(c.workspace_id), "kind": "warehouse_credential"})
+        try:
+            ref_id = record_secret(raw, kind="warehouse_credential", label="warehouse-primary",
+                                   resource_name=resource, version=version, last4=secret[-4:],
+                                   fingerprint=hashlib.sha256(secret.encode()).digest())
+            ref = SecretRef(id=str(ref_id), resource_name=resource, version=str(version))
+            guard(lambda: register_datasource(layer.catalog, ds.model_copy(update={"secret_ref": ref}), c.principal,
+                                              verified_projects(str(c.workspace_id))))
+        except BaseException:
+            secret_store.destroy(resource, version)  # never leave an unreferenced credential behind
+            raise
+        if old and old["secret_resource"] and old["secret_resource"] != resource:
+            secret_store.destroy(old["secret_resource"], old["secret_version"])
         state["tools"] = None  # reconnect with the new credentials
         return {**out, "warehouse": get_warehouse(c)}
 
@@ -422,7 +411,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         else:
             if rec["status"] == "proposed":
                 guard(lambda: t.approve(mid, c))
-            guard(lambda: t.apply(mid, c, allow_breaking=body.allowBreaking))
+            guard(lambda: t.apply(mid, c, allow_breaking=body.allow_breaking))
         log_event(f"data.migration.{action}", migration_id=mid, workspace_id=str(c.workspace_id), via="console")
         return migration_body(one(layer, mid), layer.catalog, principal_names)
 

@@ -241,13 +241,19 @@ def open_executor(catalog: Catalog, resolve_secret: Optional[SecretResolver] = N
 
 def local_secret_resolver(ref: SecretRef) -> str:
     """DEV_MODE only: `projects/local/secrets/<name>` reads env `SHIPCUBE_DATA_SECRET_<NAME>`
-    (upper-cased, '-' → '_'). Production passes a Secret Manager resolver instead."""
+    (upper-cased, '-' → '_'), then the API's local secrets file (SHIPCUBE_LOCAL_SECRETS_FILE).
+    Production passes a Secret Manager resolver instead."""
     m = _RESOURCE_RE.match(ref.resource_name)
     if not m or m["project"] != LOCAL_SECRET_PROJECT or not dev_mode():
         raise ModelError("the local secret resolver only serves projects/local secrets in SHIPCUBE_DEV_MODE", "forbidden")
     var = "SHIPCUBE_DATA_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", m["name"]).upper()
     value = os.environ.get(var)
-    if value is None and m["name"].endswith("-warehouse"):  # the local stack's one warehouse
+    if value is None:  # the API's DEV_MODE secret store: a JSON file {secret id: value}
+        path = os.environ.get("SHIPCUBE_LOCAL_SECRETS_FILE")
+        if path and os.path.exists(path):
+            with open(path) as f:
+                value = json.load(f).get(m["name"])
+    if value is None and m["name"].endswith("-warehouse"):  # the local stack's seeded warehouse
         value = os.environ.get("SHIPCUBE_DATA_WAREHOUSE_URL")
     if value is None:
         raise ModelError(f"local secret {ref.resource_name} is not set (env {var})", "no_datasource")

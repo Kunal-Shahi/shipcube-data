@@ -48,19 +48,40 @@ def api(tmp_path, monkeypatch):
     async def envelope(_, exc):
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
-    app.include_router(data_router(caller_dependency=caller, tools=tools), prefix="/v1/data")
+    store, recorded = FakeStore(), []
+
+    def record_secret(raw, **ref):
+        recorded.append((raw.email, ref))
+        return str(uuid.uuid4())
+
+    app.include_router(data_router(caller_dependency=caller, tools=tools, secret_store=store, record_secret=record_secret),
+                       prefix="/v1/data")
     client = TestClient(app)
 
     def call(method: str, path: str, who: str, **kw):
         return client.request(method, f"/v1/data{path}", headers={"X-Test-Caller": who}, **kw)
 
-    call.tools = tools
+    call.tools, call.store, call.recorded = tools, store, recorded
     return call
+
+
+class FakeStore:
+    """The API's secret store interface (shipcube_api.secret_store)."""
+
+    def __init__(self):
+        self.live: dict[str, str] = {}
+
+    def put(self, secret_id, value, labels):
+        self.live[f"projects/local/secrets/{secret_id}"] = value
+        return f"projects/local/secrets/{secret_id}", "1"
+
+    def destroy(self, resource_name, version):
+        self.live.pop(resource_name, None)
 
 
 def test_warehouse_status(api):
     w = api("GET", "/warehouse", "agent").json()
-    assert w["connected"] and w["kind"] == "duckdb" and w["modelVersion"] == 5
+    assert w["connected"] and w["kind"] == "duckdb" and w["model_version"] == 5
     assert {"label": "Status", "value": "reachable"} in w["details"] and "olist.duckdb" in str(w["details"])
 
 
@@ -68,8 +89,8 @@ def test_cubes_match_the_console_shape_and_respect_grants(api):
     cubes = {c["name"]: c for c in api("GET", "/cubes", "bob-dev").json()}
     assert set(cubes) == {"customers", "states", "orders", "products", "order_items"}
     orders = cubes["orders"]
-    assert set(orders) >= {"name", "title", "description", "table", "schema", "dimensions", "measures", "joins", "segments", "policies", "usedBy"}
-    assert orders["schema"] == "tenant_acme" and orders["usedBy"] == ["olist-demo"]
+    assert set(orders) >= {"name", "title", "description", "table", "schema", "dimensions", "measures", "joins", "segments", "policies", "used_by"}
+    assert orders["schema"] == "tenant_acme" and orders["used_by"] == ["olist-demo"]
     assert orders["policies"] == ["own_region (roles: regional_manager)"]
     assert "one table per partition" in orders["partition"]
     assert {"to": "customers", "relationship": "many_to_one", "on": "orders.customer_id = customers.customer_id"} in orders["joins"]
@@ -77,7 +98,7 @@ def test_cubes_match_the_console_shape_and_respect_grants(api):
     assert "freight" not in {m["name"] for m in cubes["order_items"]["measures"]}
     admin = api("GET", "/cubes/order_items", "carl-admin").json()
     freight = next(m for m in admin["measures"] if m["name"] == "freight")
-    assert freight["restrictedTo"] == ["finance"] and freight["type"] == "sum"
+    assert freight["restricted_to"] == ["finance"] and freight["type"] == "sum"
     assert api("GET", "/cubes/nope", "bob-dev").status_code == 404
 
 
@@ -102,9 +123,9 @@ def test_migration_review_and_person_only_apply(api):
 
     mid = propose(api, [{"op": "add_measure", "name": "orders.buyers", "sql": "customer_id", "agg": "count_distinct"}], "Buyers")
     m = api("GET", f"/migrations/{mid}", "bob-dev").json()
-    assert m["status"] == "proposed" and m["kind"] == "additive" and m["draftedBy"] == "agent"
-    assert m["diff"]["added"] == ["members:orders.buyers"] and m["impact"]["appsBroken"] == []
-    assert m["proposedBy"]["agent"] == "MCP agent" and m["proposedBy"]["user"] == str(ANA)
+    assert m["status"] == "proposed" and m["kind"] == "additive" and m["drafted_by"] == "agent"
+    assert m["diff"]["added"] == ["members:orders.buyers"] and m["impact"]["apps_broken"] == []
+    assert m["proposed_by"]["agent"] == "MCP agent" and m["proposed_by"]["user"] == str(ANA)
 
     assert api("POST", f"/migrations/{mid}:apply", "agent").json()["error"]["code"] == "permission_denied"  # agents never apply
     r = api("POST", f"/migrations/{mid}:apply", "ana")  # the agent's own person
@@ -113,7 +134,7 @@ def test_migration_review_and_person_only_apply(api):
     assert r.status_code == 403 and "admin" in r.json()["error"]["message"]
     done = api("POST", f"/migrations/{mid}:apply", "carl-admin").json()
     assert done["status"] == "applied" and done["applied"]["version"] == 6
-    assert api("GET", "/warehouse", "bob-dev").json()["modelVersion"] == 6
+    assert api("GET", "/warehouse", "bob-dev").json()["model_version"] == 6
     assert api("POST", f"/migrations/{mid}:apply", "carl-admin").status_code == 409
     assert api("POST", f"/migrations/{mid}:launch", "carl-admin").status_code == 404
 
@@ -130,7 +151,7 @@ def test_breaking_apply_needs_explicit_confirmation(api):
     assert m["kind"] == "breaking" and m["impact"]["breaks"][0]["query"] == "late_rate_by_region"
     r = api("POST", f"/migrations/{mid}:apply", "carl-admin")
     assert r.status_code == 409 and r.json()["error"]["code"] == "would_break"
-    assert api("POST", f"/migrations/{mid}:apply", "carl-admin", json={"allowBreaking": True}).json()["status"] == "applied"
+    assert api("POST", f"/migrations/{mid}:apply", "carl-admin", json={"allow_breaking": True}).json()["status"] == "applied"
 
 
 def test_warehouse_changes_are_console_admin_only_and_guarded(api):
@@ -139,7 +160,7 @@ def test_warehouse_changes_are_console_admin_only_and_guarded(api):
     assert api("POST", "/warehouse:test", "bob-dev", json=body).status_code == 403
     r = api("POST", "/warehouse:test", "carl-admin", json=body)
     assert r.status_code == 403 and "non-public" in r.json()["error"]["message"]
-    bq = {"kind": "bigquery", "project": "someone-else", "location": "US", "serviceAccountKey": "{}"}
+    bq = {"kind": "bigquery", "project": "someone-else", "location": "US", "service_account_key": "{}"}
     assert "not a verified GCP project" in api("PUT", "/warehouse", "carl-admin", json=bq).json()["error"]["message"]
     assert "pw" not in r.text
 
@@ -154,6 +175,33 @@ def test_test_and_put_a_postgres_warehouse(api, monkeypatch):
             "user": p.get("user", "postgres"), "password": p.get("password", ""), "ssl": "disable"}
     tested = api("POST", "/warehouse:test", "carl-admin", json=body)
     assert tested.status_code == 200 and tested.json()["tables"] >= 0
-    # The demo model is DuckDB SQL; switching this workspace to Postgres is refused rather than half-done.
+    # The demo model is DuckDB SQL; switching this workspace to Postgres is refused rather than half-done,
+    # and the credential that was already written to the secret store is destroyed again.
     r = api("PUT", "/warehouse", "carl-admin", json=body)
     assert r.status_code == 400 and "model is written in duckdb" in r.json()["error"]["message"]
+    assert api.store.live == {}
+    email, ref = api.recorded[0]
+    assert email == "carl@example.com" and ref["kind"] == "warehouse_credential" and ref["version"] == "1"
+    assert ref["last4"] == body["password"][-4:] and "value" not in ref
+
+
+def test_put_warehouse_without_the_api_secret_store_is_501(tmp_path, monkeypatch):
+    for k, v in {"SHIPCUBE_DEV_MODE": "1", "SHIPCUBE_DATA_CATALOG_URL": str(tmp_path / "c.db"), "SHIPCUBE_DATA_WORKSPACE": str(WS),
+                 "SHIPCUBE_DATA_DUCKDB_PATH": str(tmp_path / "olist.duckdb"), "SHIPCUBE_DATA_ALLOWED_DB_HOSTS": "127.0.0.1"}.items():
+        monkeypatch.setenv(k, v)
+    local.seed(local.Settings.from_env())
+    app = FastAPI()
+    app.include_router(data_router(caller_dependency=lambda: CALLERS["carl-admin"], tools=local.tools_from_env()), prefix="/v1/data")
+    import shipcube_data.http as h
+
+    from shipcube_data import datasources
+    from shipcube_data.warehouses import ExecResult
+
+    monkeypatch.setattr(h, "check_db_host", lambda *a: None)
+    monkeypatch.setitem(datasources.DEFAULT_CONNECTORS, "postgres",
+                        lambda ds, secret: (lambda sql, limits, qid: ExecResult(["t", "s"], [(3, 1)])))
+    with TestClient(app) as client:
+        body = {"kind": "postgres", "host": "127.0.0.1", "port": 5432, "database": "x", "user": "u", "password": "p", "ssl": "disable"}
+        assert client.post("/v1/data/warehouse:test", json=body).json() == {"tables": 3, "schemas": 1}
+        r = client.put("/v1/data/warehouse", json=body)
+    assert r.status_code == 501 and r.json()["detail"]["code"] == "data_unavailable"
