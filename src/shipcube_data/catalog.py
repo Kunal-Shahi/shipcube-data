@@ -98,19 +98,31 @@ def _entities(model: Model) -> dict[tuple[str, tuple], Row]:
 KEY_COLS = {t: [c.strip() for c in cols.split(",")] for t, cols in CURRENT_UNIQUE.items()}
 
 
+NIL_WORKSPACE = "00000000-0000-0000-0000-000000000000"
+
+
 class Catalog:
     """One workspace's catalog.
 
-    `url` is a SQLite path (":memory:" by default) or a `postgresql://` URL. On Postgres each
-    workspace gets its own schema, `catalog_ws_<uuid hex>`. Pending catalog-schema migrations
-    are applied on open unless `migrate=False` (production runs them in a deploy step:
-    `shipcube-data catalog-migrate`). One Catalog holds one connection: use one per thread.
+    `url` is a SQLite path (":memory:" by default) or a `postgresql://` URL. Every statement is
+    scoped to `workspace_id`; on the shared layout (`shared=True`, production: ShipCube's own
+    database, schema `catalog`) Postgres also enforces it with FORCE ROW LEVEL SECURITY. Without
+    `shared`, Postgres gives each workspace its own schema, `catalog_ws_<uuid hex>`.
+
+    Pending catalog-schema migrations are applied on open unless `migrate=False` (production runs
+    them as the migration role: `shipcube-data catalog-migrate`). One Catalog holds one connection:
+    use one per thread. `Catalog.on_connection` runs on a host's transaction instead (the API's
+    `db.tx(caller)`), which is how requests reach the shared layout.
     """
 
     def __init__(self, url: str | Path = ":memory:", dialect: str = "duckdb", workspace_id: Optional[str] = None,
-                 migrate: bool = True):
+                 migrate: bool = True, shared: bool = False):
         self.url = str(url)
-        self.db = Db(self.url, schema=workspace_schema(str(workspace_id) if workspace_id else None), create_schema=migrate)
+        if shared and not workspace_id:
+            raise ModelError("the shared catalog needs a workspace_id", "invalid")
+        self.ws = str(workspace_id) if workspace_id else NIL_WORKSPACE
+        self.db = Db(self.url, schema=workspace_schema(str(workspace_id) if workspace_id else None), create_schema=migrate,
+                     shared=shared, workspace_id=self.ws)
         if migrate:
             self.db.migrate_schema()
         else:
@@ -119,13 +131,34 @@ class Catalog:
                 self.db.close()
                 raise ModelError(f"catalog schema is behind ({', '.join(pending)} pending); run `shipcube-data catalog-migrate`",
                                  "catalog_not_migrated")
-        self.db.execute("INSERT INTO settings (key, value) VALUES ('dialect', ?) ON CONFLICT (key) DO NOTHING", (dialect,))
-        if workspace_id:
-            self.db.execute("INSERT INTO settings (key, value) VALUES ('workspace_id', ?) ON CONFLICT (key) DO NOTHING", (str(workspace_id),))
         self._cache: dict[int, Model] = {}
+        self.db.execute(f"INSERT INTO settings (workspace_id, key, value) VALUES (?, 'dialect', ?) ON CONFLICT ({self._pk('key')}) DO NOTHING",
+                        (self.ws, dialect))
+        if workspace_id:
+            self.db.execute(f"INSERT INTO settings (workspace_id, key, value) VALUES (?, 'workspace_id', ?) ON CONFLICT ({self._pk('key')}) DO NOTHING",
+                            (self.ws, str(workspace_id)))
+
+    @classmethod
+    def on_connection(cls, conn: Any, workspace_id: str) -> "Catalog":
+        """The shared catalog on a host's open transaction, whose RLS context is this workspace's.
+
+        Nothing is created or migrated here; a workspace with no rows simply has an empty model."""
+        cat = cls.__new__(cls)
+        cat.url, cat.ws, cat._cache = "<host transaction>", str(workspace_id), {}
+        cat.db = Db.wrap(conn, cat.ws)
+        pending = cat.db.pending_schema_migrations()
+        if pending:
+            raise ModelError(f"the catalog schema is behind ({', '.join(pending)} pending); run `shipcube-data catalog-migrate --shared`",
+                             "catalog_not_migrated")
+        return cat
+
+    def _pk(self, cols: str) -> str:
+        """An upsert's conflict target: the shared layout's keys start with workspace_id."""
+        return f"workspace_id, {cols}" if self.db.layout == "postgres_shared" else cols
 
     def set_setting(self, key: str, value: str) -> None:
-        self.db.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", (key, value))
+        self.db.execute(f"INSERT INTO settings (workspace_id, key, value) VALUES (?, ?, ?) ON CONFLICT ({self._pk('key')}) "
+                        "DO UPDATE SET value = excluded.value", (self.ws, key, value))
 
     def close(self) -> None:
         self.db.close()
@@ -134,17 +167,19 @@ class Catalog:
 
     @property
     def dialect(self) -> str:
-        return self.db.execute("SELECT value FROM settings WHERE key = 'dialect'").fetchone()[0]
+        row = self.db.execute("SELECT value FROM settings WHERE workspace_id = ? AND key = 'dialect'", (self.ws,)).fetchone()
+        return row[0] if row else "duckdb"
 
     def head(self) -> int:
-        row = self.db.execute("SELECT MAX(version) FROM model_versions WHERE rolled_back_at IS NULL").fetchone()
+        row = self.db.execute("SELECT MAX(version) FROM model_versions WHERE workspace_id = ? AND rolled_back_at IS NULL",
+                              (self.ws,)).fetchone()
         return row[0] or 0
 
     def _next_version(self) -> int:
-        return (self.db.execute("SELECT MAX(version) FROM model_versions").fetchone()[0] or 0) + 1
+        return (self.db.execute("SELECT MAX(version) FROM model_versions WHERE workspace_id = ?", (self.ws,)).fetchone()[0] or 0) + 1
 
     def versions(self) -> list[Row]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM model_versions ORDER BY version")]
+        return [dict(r) for r in self.db.execute("SELECT * FROM model_versions WHERE workspace_id = ? ORDER BY version", (self.ws,))]
 
     # ------------------------------------------------------------ model load / store
 
@@ -153,14 +188,16 @@ class Catalog:
         v = head if version is None else version
         if v > head or v < 0:
             raise ModelError(f"model version {v} does not exist (head is {head})")
-        if v and self.db.execute("SELECT rolled_back_at FROM model_versions WHERE version = ?", (v,)).fetchone()[0]:
+        if v and self.db.execute("SELECT rolled_back_at FROM model_versions WHERE workspace_id = ? AND version = ?",
+                                 (self.ws, v)).fetchone()[0]:
             raise ModelError(f"model version {v} was rolled back")
         if v in self._cache:
             return self._cache[v].model_copy(deep=True)
 
         def rows(table: str):
             return self.db.execute(
-                f"SELECT * FROM {table} WHERE since_version <= ? AND (until_version IS NULL OR until_version > ?)", (v, v)
+                f"SELECT * FROM {table} WHERE workspace_id = ? AND since_version <= ? AND (until_version IS NULL OR until_version > ?)",
+                (self.ws, v, v),
             )
 
         model = Model()
@@ -204,9 +241,10 @@ class Catalog:
                 continue
             if key in before:
                 where = " AND ".join(f"{c} = ?" for c in KEY_COLS[table])
-                self.db.execute(f"UPDATE {table} SET until_version = ? WHERE {where} AND until_version IS NULL", (version, *ident))
+                self.db.execute(f"UPDATE {table} SET until_version = ? WHERE workspace_id = ? AND {where} AND until_version IS NULL",
+                                (version, self.ws, *ident))
             if key in after:
-                row = {**after[key], "since_version": version}
+                row = {"workspace_id": self.ws, **after[key], "since_version": version}
                 cols = ", ".join(row)
                 self.db.execute(f"INSERT INTO {table} ({cols}) VALUES ({', '.join('?' * len(row))})", tuple(row.values()))
             diff["changed" if key in before and key in after else "added" if key in after else "removed"].append(label)
@@ -217,8 +255,8 @@ class Catalog:
         version = self._next_version()
         diff = self._write_diff(old, new, version)
         self.db.execute(
-            "INSERT INTO model_versions (version, migration_id, fingerprint, applied_at, applied_by) VALUES (?, ?, ?, ?, ?)",
-            (version, migration_id, new.fingerprint(), _now(), actor),
+            "INSERT INTO model_versions (workspace_id, version, migration_id, fingerprint, applied_at, applied_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (self.ws, version, migration_id, new.fingerprint(), _now(), actor),
         )
         return version, diff
 
@@ -227,20 +265,20 @@ class Catalog:
         if version != self.head():
             raise ModelError(f"only the head version ({self.head()}) can be rolled back")
         for table in CURRENT_UNIQUE:
-            self.db.execute(f"DELETE FROM {table} WHERE since_version = ?", (version,))
-            self.db.execute(f"UPDATE {table} SET until_version = NULL WHERE until_version = ?", (version,))
-        self.db.execute("UPDATE model_versions SET rolled_back_at = ? WHERE version = ?", (_now(), version))
+            self.db.execute(f"DELETE FROM {table} WHERE workspace_id = ? AND since_version = ?", (self.ws, version))
+            self.db.execute(f"UPDATE {table} SET until_version = NULL WHERE workspace_id = ? AND until_version = ?", (self.ws, version))
+        self.db.execute("UPDATE model_versions SET rolled_back_at = ? WHERE workspace_id = ? AND version = ?", (_now(), self.ws, version))
         self._cache.pop(version, None)
 
     # ------------------------------------------------------------ migrations, audit, saved queries
 
     def migration(self, mid: str) -> Optional[Row]:
-        r = self.db.execute("SELECT * FROM migrations WHERE id = ?", (mid,)).fetchone()
+        r = self.db.execute("SELECT * FROM migrations WHERE workspace_id = ? AND id = ?", (self.ws, mid)).fetchone()
         return dict(r) if r else None
 
     def migrations(self, status: Optional[str] = None) -> list[Row]:
-        sql = "SELECT * FROM migrations" + (" WHERE status = ?" if status else "") + " ORDER BY COALESCE(version, 1e9), id"
-        return [dict(r) for r in self.db.execute(sql, (status,) if status else ())]
+        sql = "SELECT * FROM migrations WHERE workspace_id = ?" + (" AND status = ?" if status else "") + " ORDER BY COALESCE(version, 1e9), id"
+        return [dict(r) for r in self.db.execute(sql, (self.ws, status) if status else (self.ws,))]
 
     def upsert_migration(self, **fields: Any) -> None:
         fields.setdefault("created_at", _now())
@@ -248,8 +286,10 @@ class Catalog:
         if existing:
             fields.pop("created_at")
             sets = ", ".join(f"{k} = ?" for k in fields if k != "id")
-            self.db.execute(f"UPDATE migrations SET {sets} WHERE id = ?", (*[v for k, v in fields.items() if k != "id"], fields["id"]))
+            self.db.execute(f"UPDATE migrations SET {sets} WHERE workspace_id = ? AND id = ?",
+                            (*[v for k, v in fields.items() if k != "id"], self.ws, fields["id"]))
         else:
+            fields = {"workspace_id": self.ws, **fields}
             cols = ", ".join(fields)
             self.db.execute(f"INSERT INTO migrations ({cols}) VALUES ({', '.join('?' * len(fields))})", tuple(fields.values()))
 
@@ -257,12 +297,16 @@ class Catalog:
         return [
             dict(r)
             for r in self.db.execute(
-                "SELECT * FROM migrations WHERE status = 'applied' AND version > ? ORDER BY version", (version,)
+                "SELECT * FROM migrations WHERE workspace_id = ? AND status = 'applied' AND version > ? ORDER BY version", (self.ws, version)
             )
         ]
 
     @property
     def workspace_id(self) -> Optional[str]:
+        if self.db.layout == "postgres_shared":
+            return self.ws
+        # A standalone catalog (one SQLite file or one schema) belongs to exactly one workspace: report
+        # that one, whoever opened it, so security_context refuses any other.
         row = self.db.execute("SELECT value FROM settings WHERE key = 'workspace_id'").fetchone()
         return row[0] if row else None
 
@@ -280,7 +324,7 @@ class Catalog:
         self.db.execute(
             "INSERT INTO audit_log (workspace_id, actor_user_id, actor_token_id, actor_type, action, target_type, target_id, detail, at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (self.workspace_id, ident if kind == "user" else None, ident if kind == "token" else None, kind,
+            (self.workspace_id or self.ws, ident if kind == "user" else None, ident if kind == "token" else None, kind,
              action if "." in action else f"data.migration.{action}", target_type, target_id or migration_id or "-",
              _j(details), _now()),
         )
@@ -289,25 +333,25 @@ class Catalog:
 
     def assign_role(self, principal_type: str, principal: str, role: str, by: Optional[str] = None) -> None:
         with self.transaction():
-            self.db.execute("INSERT INTO data_role_assignments (principal_type, principal, role, granted_by, created_at) "
-                            "VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                            (principal_type, principal.lower(), role, by, _now()))
+            self.db.execute("INSERT INTO data_role_assignments (workspace_id, principal_type, principal, role, granted_by, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                            (self.ws, principal_type, principal.lower(), role, by, _now()))
             self.audit("data.role.assign", by, target_type="data_role", target_id=role,
                        principal=f"{principal_type}:{principal.lower()}")
 
     def unassign_role(self, principal_type: str, principal: str, role: str, by: Optional[str] = None) -> None:
         with self.transaction():
-            self.db.execute("DELETE FROM data_role_assignments WHERE principal_type = ? AND principal = ? AND role = ?",
-                            (principal_type, principal.lower(), role))
+            self.db.execute("DELETE FROM data_role_assignments WHERE workspace_id = ? AND principal_type = ? AND principal = ? AND role = ?",
+                            (self.ws, principal_type, principal.lower(), role))
             self.audit("data.role.unassign", by, target_type="data_role", target_id=role,
                        principal=f"{principal_type}:{principal.lower()}")
 
     def set_attribute(self, principal_type: str, principal: str, key: str, value: Any, by: Optional[str] = None) -> None:
         with self.transaction():
-            self.db.execute("INSERT INTO data_attributes (principal_type, principal, key, value, set_by, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (principal_type, principal, key) "
+            self.db.execute("INSERT INTO data_attributes (workspace_id, principal_type, principal, key, value, set_by, created_at) "
+                            f"VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT ({self._pk('principal_type, principal, key')}) "
                             "DO UPDATE SET value = excluded.value, set_by = excluded.set_by, created_at = excluded.created_at",
-                            (principal_type, principal.lower(), key, json.dumps(value), by, _now()))
+                            (self.ws, principal_type, principal.lower(), key, json.dumps(value), by, _now()))
             self.audit("data.attribute.set", by, target_type="data_attribute", target_id=key,
                        principal=f"{principal_type}:{principal.lower()}")
 
@@ -315,8 +359,8 @@ class Catalog:
         """Roles and attributes for a set of (principal_type, principal), most specific attribute wins."""
         if not principals:
             return set(), {}
-        where = " OR ".join("(principal_type = ? AND principal = ?)" for _ in principals)
-        args = [x for p in principals for x in (p[0], p[1].lower())]
+        where = "workspace_id = ? AND (" + " OR ".join("(principal_type = ? AND principal = ?)" for _ in principals) + ")"
+        args = [self.ws] + [x for p in principals for x in (p[0], p[1].lower())]
         roles = {r[0] for r in self.db.execute(f"SELECT role FROM data_role_assignments WHERE {where}", args)}
         rank = {"workspace_role": 0, "domain": 1, "group": 2, "user": 3}
         attrs: dict[str, Any] = {}
@@ -326,20 +370,20 @@ class Catalog:
         return roles, attrs
 
     def audit_log(self) -> list[Row]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM audit_log ORDER BY id")]
+        return [dict(r) for r in self.db.execute("SELECT * FROM audit_log WHERE workspace_id = ? ORDER BY id", (self.workspace_id or self.ws,))]
 
     def save_query(self, name: str, query: dict, app: Optional[str] = None, tenant: Optional[str] = None,
                    roles: list[str] | None = None, created_by: Optional[str] = None) -> None:
         self.db.execute(
-            "INSERT INTO saved_queries (name, app, query, tenant, roles, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT (name) DO UPDATE SET app = excluded.app, query = excluded.query, tenant = excluded.tenant, "
+            "INSERT INTO saved_queries (workspace_id, name, app, query, tenant, roles, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            f"ON CONFLICT ({self._pk('name')}) DO UPDATE SET app = excluded.app, query = excluded.query, tenant = excluded.tenant, "
             "roles = excluded.roles, created_by = excluded.created_by, created_at = excluded.created_at",
-            (name, app, _j(query), tenant, _j(roles or []), created_by, _now()),
+            (self.ws, name, app, _j(query), tenant, _j(roles or []), created_by, _now()),
         )
 
     def saved_queries(self) -> list[Row]:
         out = []
-        for r in self.db.execute("SELECT * FROM saved_queries ORDER BY name"):
+        for r in self.db.execute("SELECT * FROM saved_queries WHERE workspace_id = ? ORDER BY name", (self.ws,)):
             d = dict(r)
             d["query"], d["roles"] = _loads(d["query"]), _loads(d["roles"])
             out.append(d)
@@ -359,7 +403,7 @@ class Catalog:
         return [
             dict(r)
             for r in self.db.execute(
-                "SELECT name, kind, agg, sql, since_version, until_version FROM members WHERE cube = ? AND name = ? ORDER BY since_version",
-                (cube, member),
+                "SELECT name, kind, agg, sql, since_version, until_version FROM members WHERE workspace_id = ? AND cube = ? AND name = ? "
+                "ORDER BY since_version", (self.ws, cube, member),
             )
         ]

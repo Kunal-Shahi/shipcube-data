@@ -161,12 +161,12 @@ def register_datasource(catalog: Catalog, ds: Datasource, actor: Optional[str] =
         options["verified"] = True
     with catalog.transaction() as cat:
         cat.db.execute(
-            "INSERT INTO datasources (name, kind, secret_ref_id, secret_resource, secret_version, options, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, "
+            "INSERT INTO datasources (workspace_id, name, kind, secret_ref_id, secret_resource, secret_version, options, created_by, created_at) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT ({cat._pk('name')}) DO UPDATE SET kind = excluded.kind, "
             "secret_ref_id = excluded.secret_ref_id, secret_resource = excluded.secret_resource, "
             "secret_version = excluded.secret_version, options = excluded.options, "
             "created_by = excluded.created_by, created_at = excluded.created_at",
-            (ds.name, ds.kind, ds.secret_ref.id if ds.secret_ref else None,
+            (cat.ws, ds.name, ds.kind, ds.secret_ref.id if ds.secret_ref else None,
              ds.secret_ref.resource_name if ds.secret_ref else None, ds.secret_ref.version if ds.secret_ref else None,
              json.dumps(options, sort_keys=True), actor, _now()),
         )
@@ -177,7 +177,7 @@ def register_datasource(catalog: Catalog, ds: Datasource, actor: Optional[str] =
 
 
 def get_datasource(catalog: Catalog, name: str = "primary") -> Datasource:
-    r = catalog.db.execute("SELECT * FROM datasources WHERE name = ?", (name,)).fetchone()
+    r = catalog.db.execute("SELECT * FROM datasources WHERE workspace_id = ? AND name = ?", (catalog.ws, name)).fetchone()
     if r is None:
         raise ModelError(f"no datasource {name!r}; connect a warehouse in the console", "no_datasource")
     ref = SecretRef(id=r["secret_ref_id"], resource_name=r["secret_resource"], version=r["secret_version"]) if r["secret_ref_id"] else None

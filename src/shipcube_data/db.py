@@ -54,20 +54,37 @@ class Result:
         return iter(self.rows)
 
 
+SHARED_SCHEMA = "catalog"
+
+
 class Db:
-    """A single connection. Not thread-safe: use one Db (one Catalog) per thread or request."""
+    """A single connection. Not thread-safe: use one Db (one Catalog) per thread or request.
+
+    Layouts (`self.layout`, also the catalog_migrations/ directory):
+    * "sqlite": one file per catalog (local development, tests).
+    * "postgres": one schema per workspace (`catalog_ws_<hex>`); standalone deployments.
+    * "postgres_shared": ShipCube's own database, schema `catalog`, every table keyed by
+      workspace_id under FORCE ROW LEVEL SECURITY (workspace_id = app_workspace()). This is the
+      production layout. Requests run on the host's transaction (`Db.wrap`), which has already
+      set app.workspace_id for the verified caller; nothing is created at request time.
+    """
 
     kind: str
+    layout: str
+    wrapped: bool = False
 
-    def __init__(self, url: str, schema: Optional[str] = None, create_schema: bool = True):
+    def __init__(self, url: str, schema: Optional[str] = None, create_schema: bool = True,
+                 shared: bool = False, workspace_id: Optional[str] = None):
         self.url = url
         self._depth = 0
         self._lock = threading.RLock()
+        self.workspace_id = workspace_id
         if url.startswith(("postgres://", "postgresql://")):
             import psycopg
 
             self.kind = "postgres"
-            self.schema = schema or "catalog_default"
+            self.layout = "postgres_shared" if shared else "postgres"
+            self.schema = SHARED_SCHEMA if shared else (schema or "catalog_default")
             if not _SCHEMA_RE.match(self.schema):
                 raise ModelError(f"invalid catalog schema name {self.schema!r}")
             self.conn = psycopg.connect(url, autocommit=True, connect_timeout=10)
@@ -76,15 +93,36 @@ class Db:
             elif not self.conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.schema,)).fetchone():
                 self.conn.close()
                 raise ModelError(f"no catalog for this workspace (schema {self.schema} does not exist)", "catalog_not_migrated")
-            self.conn.execute(f'SET search_path TO "{self.schema}"')
+            if shared:
+                # app_workspace() and friends live in public; RLS reads app.workspace_id for every statement.
+                self.conn.execute(f'SET search_path TO "{self.schema}", public')
+                if workspace_id:
+                    self.conn.execute("SELECT set_config('app.workspace_id', %s, false)", (str(workspace_id),))
+            else:
+                self.conn.execute(f'SET search_path TO "{self.schema}"')
         else:
-            self.kind = "sqlite"
+            if shared:
+                raise ModelError("the shared catalog layout needs Postgres", "invalid")
+            self.kind = self.layout = "sqlite"
             self.schema = None
             path = url.removeprefix("sqlite:///").removeprefix("sqlite://") or ":memory:"
             self.conn = sqlite3.connect(path, isolation_level=None, timeout=30, check_same_thread=False)
             self.conn.execute("PRAGMA foreign_keys = ON")
             if path != ":memory:":
                 self.conn.execute("PRAGMA journal_mode = WAL")
+
+    @classmethod
+    def wrap(cls, conn: Any, workspace_id: str) -> "Db":
+        """Use the host's open transaction (ShipCube API: `db.tx(caller)`, RLS context already set).
+
+        The host owns the transaction and commits it; our transactions become savepoints, and
+        writers serialise on pg_advisory_xact_lock(hashtext('catalog:' || workspace_id))."""
+        db = cls.__new__(cls)
+        db.url, db._depth, db._lock = "<host transaction>", 0, threading.RLock()
+        db.kind, db.layout, db.schema, db.wrapped, db.workspace_id = "postgres", "postgres_shared", SHARED_SCHEMA, True, workspace_id
+        db.conn = conn
+        conn.execute("SELECT set_config('search_path', %s, true)", (f'"{SHARED_SCHEMA}", public',))
+        return db
 
     # ------------------------------------------------------------ statements
 
@@ -97,7 +135,8 @@ class Db:
             if cur.description is None:
                 return Result([], cur.rowcount)
             names = [d[0] for d in cur.description]
-            return Result([Row(names, r) for r in cur.fetchall()], cur.rowcount)
+            rows = cur.fetchall()  # tuples, or dicts on a host connection with dict_row
+            return Result([Row(names, [r[n] for n in names] if isinstance(r, dict) else r) for r in rows], cur.rowcount)
 
     def script(self, sql: str) -> None:
         with self._lock:
@@ -116,9 +155,25 @@ class Db:
 
     # ------------------------------------------------------------ transactions
 
+    def _lock_sql(self) -> tuple[str, tuple]:
+        if self.layout == "postgres_shared":
+            return "SELECT pg_advisory_xact_lock(hashtext(?))", (f"catalog:{self.workspace_id}",)
+        return "SELECT pg_advisory_xact_lock(?)", (lock_key(self.schema or ""),)
+
     @contextmanager
     def transaction(self, lock: bool = True) -> Iterator["Db"]:
         """Nested calls join the outer transaction. `lock` serialises writers of this catalog."""
+        if self.wrapped:  # the host's transaction: a savepoint, so a failed write undoes only itself
+            with self._lock, self.conn.transaction():
+                outer = self._depth == 0
+                self._depth += 1
+                try:
+                    if lock and outer:
+                        self.execute(*self._lock_sql())
+                    yield self
+                finally:
+                    self._depth -= 1
+            return
         with self._lock:
             if self._depth:
                 self._depth += 1
@@ -131,7 +186,7 @@ class Db:
             self._depth = 1
             try:
                 if lock and self.kind == "postgres":
-                    self.execute("SELECT pg_advisory_xact_lock(?)", (lock_key(self.schema or ""),))
+                    self.execute(*self._lock_sql())
                 yield self
             except BaseException:
                 self._depth = 0
@@ -146,13 +201,14 @@ class Db:
         return self._depth > 0
 
     def close(self) -> None:
-        self.conn.close()
+        if not self.wrapped:  # the host owns its connection
+            self.conn.close()
 
     # ------------------------------------------------------------ schema migrations
 
     def _schema_files(self) -> list:
         return sorted(
-            (f for f in resources.files("shipcube_data.catalog_migrations").joinpath(self.kind).iterdir() if f.name.endswith(".sql")),
+            (f for f in resources.files("shipcube_data.catalog_migrations").joinpath(self.layout).iterdir() if f.name.endswith(".sql")),
             key=lambda f: f.name,
         )
 
@@ -199,6 +255,8 @@ class Db:
         if self.kind != "postgres":
             yield
             return
+        if self.wrapped:
+            raise ModelError("catalog DDL runs as the migration role (shipcube-data catalog-migrate), never on a request", "forbidden")
         key = lock_key("schema:" + (self.schema or ""))
         self.execute("SELECT pg_advisory_lock(?)", (key,))
         try:

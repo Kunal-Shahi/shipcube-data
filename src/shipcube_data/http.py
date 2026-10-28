@@ -116,7 +116,8 @@ def migration_body(rec: dict[str, Any], catalog, names: PrincipalNames) -> dict[
     if raw == "approved":
         body["approved"] = {"at": _iso(rec.get("decided_at")), "by": names(rec.get("approved_by"), rec.get("approved_by_user"))["user"]}
     if raw == "applied":
-        v = catalog.db.execute("SELECT applied_at, applied_by FROM model_versions WHERE version = ?", (rec["version"],)).fetchone()
+        v = catalog.db.execute("SELECT applied_at, applied_by FROM model_versions WHERE workspace_id = ? AND version = ?",
+                               (catalog.ws, rec["version"])).fetchone()
         body["applied"] = {"version": rec["version"], "at": _iso(v["applied_at"] if v else rec.get("applied_at")),
                            "by": names(v["applied_by"] if v else None, rec.get("approved_by_user"))["user"]}
     if raw == "rejected":
@@ -275,7 +276,7 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
     def get_warehouse(c: Caller = Depends(reader)) -> dict[str, Any]:
         _, layer, _ = layer_ctx(c)
         cat = layer.catalog
-        row = cat.db.execute("SELECT * FROM datasources WHERE name = 'primary'").fetchone()
+        row = cat.db.execute("SELECT * FROM datasources WHERE workspace_id = ? AND name = 'primary'", (cat.ws,)).fetchone()
         if row is None:
             return {"connected": False, "model_version": cat.head()}
         ds = get_datasource(cat)
@@ -344,7 +345,8 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         out = probe(ds, secret)  # never store credentials that don't work
         if secret_store is None or record_secret is None:
             raise http_error("data_unavailable", "saving warehouse credentials needs the API's secret store")
-        old = layer.catalog.db.execute("SELECT secret_resource, secret_version FROM datasources WHERE name = 'primary'").fetchone()
+        old = layer.catalog.db.execute("SELECT secret_resource, secret_version FROM datasources WHERE workspace_id = ? AND name = 'primary'",
+                                       (layer.catalog.ws,)).fetchone()
         secret_id = f"ws-{c.workspace_id}-warehouse_credential-{uuid.uuid4()}"
         resource, version = secret_store.put(secret_id, secret, {"workspace": str(c.workspace_id), "kind": "warehouse_credential"})
         try:
