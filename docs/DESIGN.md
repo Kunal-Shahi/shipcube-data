@@ -96,7 +96,7 @@ You can still keep migrations in Git, as the demo's `examples/olist/migrations/*
                                          │                  │
                          verified identity → SecurityContext │
                                                             ▼
-            ┌──── catalog DB (Postgres, a schema per workspace; SQLite in dev) ──┐
+            ┌── catalog: ShipCube's Postgres, schema `catalog`, FORCE RLS (SQLite in dev) ──┐
             │ cubes, members, member_aliases, joins, segments, partition_specs, │
             │ schema_bindings, row_policies   (all SCD2: since/until version)   │
             │ model_versions, migrations, saved_queries, audit_log, settings    │
@@ -133,9 +133,19 @@ Migrations are **pure functions on the model**. `apply_ops(model, ops)` returns 
 
 ## 4. The catalog schema
 
-The DDL lives in versioned catalog-schema migrations, `src/shipcube_data/catalog_migrations/{postgres,sqlite}/NNNN_*.sql`. They are recorded in `catalog_schema_migrations` with a checksum, so editing an applied file is refused. `shipcube-data catalog-migrate` applies them under a session advisory lock. Postgres uses `JSONB` and `TIMESTAMPTZ`; SQLite stores the same data as `TEXT`.
+The DDL lives in versioned catalog-schema migrations, `src/shipcube_data/catalog_migrations/{postgres_shared,postgres,sqlite}/NNNN_*.sql`. They are recorded in `catalog_schema_migrations` with a checksum, so editing an applied file is refused. `shipcube-data catalog-migrate` applies them under a session advisory lock. Postgres uses `JSONB` and `TIMESTAMPTZ`; SQLite stores the same data as `TEXT`.
 
-**One Postgres schema per workspace.** On Postgres, each workspace's catalog lives in its own schema, `catalog_ws_<workspace uuid hex>`. The connection's `search_path` points at that schema. This gives hard isolation between workspaces without a `workspace_id` predicate in every statement. Each workspace also gets its own migration lock and its own schema-migration state. The trade-off: a schema per workspace is fine for thousands of workspaces, but listing across workspaces needs a `UNION` over schemas, which only operators ever need.
+**Production layout: ShipCube's database, schema `catalog`, forced row-level security.** This is security's decision (Oct 29).
+
+- **Rows.** Every table has `workspace_id`, and every statement filters and writes it explicitly.
+- **Policy.** Postgres enforces `ENABLE` + `FORCE ROW LEVEL SECURITY` with `USING (workspace_id = app_workspace()) WITH CHECK (workspace_id = app_workspace())`. This is the same mechanism as the API's 17 tenant tables, and the same cross-workspace check covers it.
+- **Requests.** They run on the API's own transaction, `db.tx(caller)`, as `shipcube_app` (no BYPASSRLS, no CREATE), which has set `app.workspace_id` from the verified caller. `Catalog.on_connection` and `DataTools(session=…)` do this.
+- **It fails closed.** A missing `app.workspace_id` makes `app_workspace()` NULL and every query returns zero rows. A wrong workspace id in code cannot read or write another tenant's rows (`WITH CHECK`).
+- **Locking.** Writers in one workspace serialise on `pg_advisory_xact_lock(hashtext('catalog:' || workspace_id))`. Model versions are rows, never DDL.
+- **DDL.** `catalog_migrations/postgres_shared/` is applied by the migration role (`shipcube-data catalog-migrate --shared`), after the API's own migrations (it needs `app_workspace()`). Nothing is created at request time.
+- **Tests.** `tests/test_shared_catalog.py` checks all of this as a non-owner role. Every catalog-backed test also runs on this layout.
+
+**Standalone layouts** (no ShipCube API): a SQLite file, or one Postgres schema per workspace (`catalog_ws_<hex>`). They use the same workspace-scoped statements.
 
 ### 4.1 Model tables (versioned)
 
@@ -377,7 +387,7 @@ sha256(
 
 | Area | Status |
 |---|---|
-| Catalog on Postgres (a schema per workspace) and SQLite, SCD2, audit, saved queries, versioned catalog-schema migrations | Built; tested on both |
+| Catalog in ShipCube's Postgres (schema `catalog`, FORCE RLS on workspace_id, requests on the API's `db.tx(caller)`), plus standalone SQLite / schema-per-workspace; SCD2, audit, saved queries, versioned catalog-schema migrations | Built; every catalog test runs on all three, RLS tested as a non-owner role |
 | Concurrency-safe apply, propose, approve and rollback | Built; raced on both backends |
 | Warehouse adapters with timeouts, row limits and cost guards | Cloud SQL Postgres and BigQuery integration-tested against real servers; DuckDB for development |
 | Structured JSON logs with query and request ids; metrics hook | Built |

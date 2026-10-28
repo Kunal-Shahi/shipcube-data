@@ -4,7 +4,7 @@ Everything in ShipCube runs and is tested locally before it is pushed. On ShipCu
 
 | Piece | Local | Production |
 |---|---|---|
-| Catalog | the stack's Postgres, database `shipcube_data`, schema `catalog_ws_<workspace hex>` | Cloud SQL Postgres, same layout |
+| Catalog | the stack's Postgres: ShipCube's database, schema `catalog`, FORCE RLS (`SHIPCUBE_DATA_CATALOG_LAYOUT=shared`) | Cloud SQL Postgres, same layout |
 | Warehouse | a DuckDB file (`/data/olist.duckdb`), or the stack's Postgres, database `warehouse` | the customer's Cloud SQL Postgres or BigQuery |
 | Model | the Olist demo migrations, applied with the migration runner | migrations proposed by agents and approved in the console |
 | Tools | `data_*` mounted in the MCP server by `shipcube_data.local.tools_from_env()` | the same |

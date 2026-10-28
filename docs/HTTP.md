@@ -52,8 +52,13 @@ Errors are `HTTPException(status, {code, message, hint})`, which the API wraps a
 
 **Who may do what.** A person means a console session (`via == "console"`, no token), mirroring the API's `console_session`. A PAT gets 403 on `:test`, `PUT`, `:apply` and `:reject`.
 
-**Databases.** The catalog is shipcube-data's own database (`SHIPCUBE_DATA_CATALOG_URL`), with one schema per workspace. At request time the router never creates schemas: a workspace without a catalog gets `catalog_not_migrated`. Provisioning (`shipcube-data catalog-migrate` / `seed`) runs as the migration role (sc-migrator), never as the API's runtime role. The API's own database is touched only through `record_secret`, in the API's transaction.
+**Databases.** The catalog lives in ShipCube's own database, schema `catalog`, under FORCE row-level security on `workspace_id = app_workspace()`.
 
-- **Workspace.** Every request opens the caller's own workspace catalog (on Postgres, schema `catalog_ws_<uuid hex>`), so one workspace never reads another's model, migrations or warehouse.
+- The API builds the tools with `tools_from_env(catalog_session=lambda caller: db.tx(caller))`, so every request runs in its own `db.tx(caller)` as `shipcube_app`.
+- Nothing is created at request time.
+- The catalog DDL (`shipcube-data catalog-migrate --shared`) runs as the migration role.
+- The API's `secret_refs` is written only through `record_secret`.
+
+- **Workspace.** Every request sees only the caller's workspace rows. Postgres enforces it (RLS on `app.workspace_id` from the verified caller), and every statement also filters `workspace_id` explicitly.
 - **Grants.** Grants and row policies come from that catalog.
 - **Who can change things.** PATs can read, but never apply, reject or touch the warehouse. Agents only ever propose, through `data_propose_migration`.

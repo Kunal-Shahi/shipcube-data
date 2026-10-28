@@ -2,7 +2,7 @@
 
 ShipCube's data layer is a semantic layer whose models live in a database, not in YAML files.
 
-You define base cubes, measures, dimensions and joins through versioned **model migrations**. Migrations are applied to and stored in a catalog database: Postgres in production, with a schema per workspace. Queries are typed and compile to SQL over one warehouse database, organised by schema and partition. That warehouse is Cloud SQL Postgres or BigQuery, with timeouts, row limits and cost guards on every query.
+You define base cubes, measures, dimensions and joins through versioned **model migrations**. Migrations are applied to and stored in a catalog: in production, the schema `catalog` in ShipCube's own Postgres, under forced row-level security per workspace. Queries are typed and compile to SQL over one warehouse database, organised by schema and partition. That warehouse is Cloud SQL Postgres or BigQuery, with timeouts, row limits and cost guards on every query.
 
 Part of [ShipCube](https://github.com/Kunal-Shahi/shipcube).
 

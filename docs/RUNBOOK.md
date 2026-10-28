@@ -7,7 +7,7 @@ How to run, configure, deploy and operate the data layer. The data layer runs in
 | Piece | Where it runs | State |
 |---|---|---|
 | Library `shipcube_data` | inside `shipcube-mcp` (MCP tools, API routes, console actions) | none |
-| Catalog | Cloud SQL Postgres, one schema per workspace (`catalog_ws_<uuid hex>`) | model versions, migrations, audit, saved queries, datasources, data roles and attributes |
+| Catalog | Cloud SQL Postgres, ShipCube's own database, schema `catalog` (FORCE RLS on workspace_id) | model versions, migrations, audit, saved queries, datasources, data roles and attributes |
 | Warehouses | the customer's Cloud SQL Postgres or BigQuery, registered per workspace | read-only access |
 | Muse Spark | Meta Model API (`https://api.meta.ai/v1`) | none |
 | Result cache | in-process LRU per instance | disposable |
@@ -72,15 +72,15 @@ The README's CLI section shows a DuckDB demo warehouse end to end.
 ## 4. Deploy
 
 1. **Dependency.** `shipcube-mcp` depends on `shipcube-data[postgres,bigquery] @ git+https://github.com/Kunal-Shahi/shipcube-data@<tag or commit>`. Pin a tag or commit; never track `main` in production.
-2. **Catalog database.** Create it in the Cloud SQL instance, for example `shipcube_data`, owned by a migration role. The service connects as `shipcube_app`, which has DML only. Use IAM database auth, so no password lives in the URL.
-3. **Catalog-schema migrations run before the new revision takes traffic** (a Cloud Run job, or a step in the deploy pipeline), once per workspace schema:
+2. **Catalog database.** The catalog is the schema `catalog` in ShipCube's own database. The API reaches it through its own `db.tx(caller)`, as `shipcube_app` (DML only, no BYPASSRLS, no CREATE). It gets DML on these tables from the API's `owner_defaults.sql`.
+3. **Catalog-schema migrations run before the new revision takes traffic**, as the migration role and after the API's own migrations (the catalog's policies use `app_workspace()`):
 
    ```bash
-   shipcube-data catalog-migrate --catalog "$SHIPCUBE_DATA_CATALOG_URL" --workspace <workspace uuid>
+   shipcube-data catalog-migrate --shared --catalog "$MIGRATOR_DATABASE_URL"
    ```
 
    This step:
-   - is idempotent, and serialised per schema by an advisory lock;
+   - is idempotent, and serialised by an advisory lock;
    - refuses to run if an applied file was edited (`changed after it was applied`).
 
    Never edit an applied `catalog_migrations/*.sql`; add the next number instead. A service that opens a catalog with `migrate=False` refuses to start on a stale schema (`catalog_not_migrated`).
@@ -129,15 +129,17 @@ Wire `DataLayer(metrics=…)` to Cloud Monitoring. The metrics and suggested ale
 | `warehouse_unavailable` | The warehouse is down, network, or credentials | The adapter has already retried with backoff. Check the customer's Cloud SQL / BigQuery status and the datasource's secret version. |
 | `conflict` on apply | Another migration touched the same member after the proposal's base version | Expected. Re-propose against the new head; the console shows both migrations. |
 | `would_break` on apply | The impact now includes broken saved queries | Fix the app first, or have an admin apply with "allow breaking". |
-| `catalog_not_migrated` at startup | The deploy step was skipped | Run `catalog-migrate` (§4.3) for the workspace. |
+| `catalog_not_migrated` | The deploy step was skipped | Run `shipcube-data catalog-migrate --shared` (§4.3). |
 | A bad migration was applied | – | Run `shipcube-data rollback --dry-run` (shows impact), then `rollback`. Only the head version can be rolled back. For older migrations, write a forward migration that reverses them. |
 | Muse drafts fail (`draft.muse_fallback`) | API key, quota or outage | Drafting continues with rules, and the proposal shows `explained_by: rules`. Check the key's Secret Manager version and the Meta API status. |
 | Lock waits on apply | A long `apply`: impact analysis compiles every saved query inside the lock | Expected to be seconds. Find blockers with `SELECT * FROM pg_locks WHERE locktype = 'advisory'`. |
 
 ### Inspecting a workspace's catalog
 
+As the migration role, or any role, after `SELECT set_config('app.workspace_id', '<uuid>', false)`. RLS shows nothing otherwise:
+
 ```sql
-SET search_path TO catalog_ws_<uuid hex>;
+SET search_path TO catalog, public;
 SELECT version, migration_id, fingerprint, applied_at, applied_by, rolled_back_at FROM model_versions ORDER BY version;
 SELECT id, status, kind, proposed_by, approved_by, version FROM migrations ORDER BY created_at DESC LIMIT 20;
 SELECT at, actor_type, action, target_id, detail FROM audit_log ORDER BY id DESC LIMIT 50;

@@ -33,11 +33,11 @@ from shipcube_data import (
     Datasource, SecretRef,         # warehouse connections
 )
 
-def data_layer_for(workspace_id):            # one catalog schema per workspace on Postgres
-    catalog = Catalog(catalog_dsn_for(workspace_id), workspace_id=str(workspace_id))
-    return DataLayer.from_catalog(catalog, resolve_secret=secret_manager_access, connectors=WAREHOUSE_CONNECTORS)
+from shipcube_api import db
+from shipcube_data.local import tools_from_env
 
-tools = DataTools(layer_for=data_layer_for)   # drafter defaults to MuseDrafter.from_env()
+# Every tool call runs in the API's db.tx(caller): the shared catalog under RLS, as shipcube_app.
+tools = tools_from_env(catalog_session=lambda caller: db.tx(caller))   # drafter defaults to MuseDrafter.from_env()
 
 for spec in tools.specs():                   # data_list_cubes … data_propose_migration
     server.register(spec["name"], spec["description"], spec["inputSchema"],
