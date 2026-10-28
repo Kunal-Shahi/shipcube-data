@@ -17,6 +17,8 @@ Everything is configured from the environment, the same variables in compose and
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import threading
 import uuid
@@ -51,6 +53,7 @@ class Settings:
     warehouse_url: Optional[str] = None
     tenants: dict[str, str] = field(default_factory=dict)
     migrations: Optional[str] = None
+    shared: bool = False  # the catalog is ShipCube's database, schema `catalog`, under RLS (production layout)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,6 +70,7 @@ class Settings:
             duckdb_path=os.environ.get("SHIPCUBE_DATA_DUCKDB_PATH", ".local/olist.duckdb"),
             warehouse_url=os.environ.get("SHIPCUBE_DATA_WAREHOUSE_URL"),
             tenants=tenants, migrations=os.environ.get("SHIPCUBE_DATA_MIGRATIONS"),
+            shared=shared_layout(),
         )
 
     @property
@@ -116,7 +120,7 @@ def seed(s: Settings, force: bool = False) -> dict[str, Any]:
     else:
         raise ModelError(f"unknown SHIPCUBE_DATA_WAREHOUSE {s.warehouse!r}", "invalid")
 
-    cat = Catalog(s.catalog_url, dialect=ds.kind, workspace_id=s.workspace)
+    cat = Catalog(s.catalog_url, dialect=ds.kind, workspace_id=s.workspace, shared=s.shared)
     try:
         register_datasource(cat, ds, SEED_ACTOR)
         runner = Runner(cat)
@@ -153,15 +157,76 @@ def ensure_database(url: str) -> None:
 
 # ---------------------------------------------------------------- serving
 
-def tools_from_env(**kwargs: Any) -> DataTools:
-    """The DataTools the MCP server mounts. One catalog connection and warehouse connection per
-    (thread, workspace), opened lazily; workspaces without a seeded catalog get catalog_not_migrated."""
+def shared_layout() -> bool:
+    """SHIPCUBE_DATA_CATALOG_LAYOUT=shared: ShipCube's database, schema `catalog`, FORCE RLS (production)."""
+    layout = os.environ.get("SHIPCUBE_DATA_CATALOG_LAYOUT", "schema")
+    if layout not in {"schema", "shared"}:
+        raise ModelError(f"SHIPCUBE_DATA_CATALOG_LAYOUT must be schema or shared, not {layout!r}", "invalid")
+    return layout == "shared"
+
+
+class ExecutorCache:
+    """Warehouse connections, shared by every request of a workspace and reopened when its
+    datasource changes (the key includes the credential's pinned version)."""
+
+    def __init__(self, resolver: Callable) -> None:
+        self.resolver, self.cache, self.lock = resolver, {}, threading.Lock()
+
+    def executor(self, catalog: Catalog) -> Callable:
+        from .datasources import get_datasource, open_executor
+
+        def run(sql: str, limits: Any, query_id: str):
+            ds = get_datasource(catalog)
+            ref = ds.secret_ref
+            key = (catalog.ws, ds.kind, ref.resource_name if ref else None, ref.version if ref else None,
+                   json.dumps(ds.options, sort_keys=True))
+            with self.lock:
+                ex = self.cache.get(key)
+            if ex is None:
+                ex = open_executor(catalog, self.resolver)
+                with self.lock:
+                    self.cache[key] = ex
+            return ex(sql, limits, query_id)
+
+        return run
+
+    def forget(self, workspace_id: Any) -> None:
+        with self.lock:
+            for k in [k for k in self.cache if k[0] == str(workspace_id)]:
+                del self.cache[k]
+
+
+def tools_from_env(catalog_session: Optional[Callable[[Caller], Any]] = None, **kwargs: Any) -> DataTools:
+    """The DataTools the MCP server and the API mount.
+
+    With `catalog_session(caller) -> context manager of a DB-API connection`, every tool call runs
+    in that host transaction (ShipCube's API: `db.tx(caller)`, whose RLS context is the caller's
+    workspace) against the shared catalog. This is the production path: nothing here opens a
+    catalog connection of its own or creates anything.
+
+    Without it, the catalog is opened from SHIPCUBE_DATA_CATALOG_URL (SHIPCUBE_DATA_CATALOG_LAYOUT
+    schema|shared), one connection per (thread, workspace), lazily. Workspaces without a catalog
+    get catalog_not_migrated. Warehouse connections are cached per workspace and datasource either way.
+    """
     from .secrets import resolver_from_env
+
+    executors = ExecutorCache(resolver_from_env())
+
+    if catalog_session is not None:
+        @contextlib.contextmanager
+        def session(caller: Caller):
+            with catalog_session(caller) as conn:
+                catalog = Catalog.on_connection(conn, str(caller.workspace_id))
+                yield DataLayer(catalog, executors.executor(catalog))
+
+        tools = DataTools(session=session, **kwargs)
+        tools.forget_workspace = executors.forget  # type: ignore[attr-defined]
+        return tools
 
     url = os.environ.get("SHIPCUBE_DATA_CATALOG_URL")
     if not url:
         raise ModelError("SHIPCUBE_DATA_CATALOG_URL is not set", "invalid")
-    resolver = resolver_from_env()
+    shared = shared_layout()
     cache: dict[tuple[int, str], DataLayer] = {}  # (thread, workspace): connections are per thread
     lock = threading.Lock()
 
@@ -170,13 +235,15 @@ def tools_from_env(**kwargs: Any) -> DataTools:
         with lock:
             layer = cache.get(key)
         if layer is None:
-            layer = DataLayer.from_catalog(Catalog(url, workspace_id=key[1], migrate=False), resolver)
+            catalog = Catalog(url, workspace_id=key[1], migrate=False, shared=shared)
+            layer = DataLayer(catalog, executors.executor(catalog))
             with lock:
                 cache[key] = layer
         return layer
 
     def forget(workspace_id: uuid.UUID) -> None:
-        """Drop every thread's cached layer for a workspace (e.g. after its warehouse credentials change)."""
+        """Drop a workspace's cached layers and warehouse connections (e.g. after its credentials change)."""
+        executors.forget(workspace_id)
         with lock:  # don't close them: another thread may be mid-request; they're released when unreferenced
             for k in [k for k in cache if k[1] == str(workspace_id)]:
                 del cache[k]
@@ -257,8 +324,12 @@ def smoke(s: Settings, tools: Optional[DataTools] = None, say: Callable[[str], N
         proposal.update(out)
         return f"{out['id']} ({out['kind']}, widens {out['widens_exposure']}), impact: {len(out['impact']['breaks'])} breaks"
 
+    def head() -> int:
+        with tools.session(agent) as layer:
+            return layer.catalog.head()
+
     def cannot_apply() -> str:
-        head = tools.layer_for(ws).catalog.head()
+        before = head()
         for name in ("apply_migration", "data_apply_migration"):
             try:
                 tools.call(name, {"id": proposal["id"]}, agent)
@@ -271,9 +342,10 @@ def smoke(s: Settings, tools: Optional[DataTools] = None, say: Callable[[str], N
                 raise AssertionError(f"{action.__name__} ran for an agent token")
             except ToolError as e:
                 assert e.code == "forbidden", e.to_dict()
-        cat = tools.layer_for(ws).catalog
-        assert cat.head() == head and cat.migration(proposal["id"])["status"] == "proposed"
-        Runner(cat).reject(proposal["id"], SEED_ACTOR, "smoke test cleanup")
+        with tools.session(agent) as layer:
+            cat = layer.catalog
+            assert cat.head() == before and cat.migration(proposal["id"])["status"] == "proposed"
+            Runner(cat).reject(proposal["id"], SEED_ACTOR, "smoke test cleanup")
         return "no apply tool; apply/approve refused for the agent token; model unchanged; proposal rejected"
 
     for name, fn in [("tools", tool_names), ("data_list_cubes", list_cubes), ("data_describe_cube", describe),

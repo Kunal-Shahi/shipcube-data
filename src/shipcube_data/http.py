@@ -21,6 +21,7 @@ person's console session: agents only ever propose.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -254,11 +255,13 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
             raise http_error("forbidden", "only a person in the console can do this; agents can only propose")
         return c
 
-    def layer_ctx(c: Caller):
+    @contextlib.contextmanager
+    def opened(c: Caller):
+        """One data session per request: on ShipCube's API, one db.tx(caller) under the caller's RLS."""
         t = get_tools()
         try:
-            layer = t.layer_for(c.workspace_id)
-            return t, layer, security_context(c, layer.catalog)
+            with t.session(c) as layer:
+                yield t, layer, security_context(c, layer.catalog)
         except ModelError as e:
             raise http_error(e.code, str(e), e.hint) from None
 
@@ -274,27 +277,27 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
 
     @router.get("/warehouse")
     def get_warehouse(c: Caller = Depends(reader)) -> dict[str, Any]:
-        _, layer, _ = layer_ctx(c)
-        cat = layer.catalog
-        row = cat.db.execute("SELECT * FROM datasources WHERE workspace_id = ? AND name = 'primary'", (cat.ws,)).fetchone()
-        if row is None:
-            return {"connected": False, "model_version": cat.head()}
-        ds = get_datasource(cat)
-        details = [{"label": k.replace("_", " ").capitalize(), "value": str(v)} for k, v in sorted(ds.options.items())
-                   if k in {"host", "port", "dbname", "user", "project", "location", "impersonate_service_account"}]
-        if ds.kind == "duckdb":
-            details.append({"label": "File", "value": os.path.basename(str(ds.options.get("path", "")))})
-        if ds.secret_ref:
-            details.append({"label": "Credential", "value": f"Secret Manager reference {ds.secret_ref.id[:8]} (version {ds.secret_ref.version})"})
-        checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        try:
-            layer.execute("SELECT 1", layer.limits, "q_health")
-            details.append({"label": "Status", "value": "reachable"})
-        except ModelError as e:
-            details.append({"label": "Status", "value": f"unreachable ({e.code})"})
-        return {"connected": True, "kind": ds.kind, "name": ds.options.get("dbname") or ds.options.get("project") or ds.name,
-                "details": details, "connected_at": _iso(row["created_at"]), "connected_by": principal_names(row["created_by"], None)["user"],
-                "last_checked_at": checked, "model_version": cat.head()}
+        with opened(c) as (_, layer, _):
+            cat = layer.catalog
+            row = cat.db.execute("SELECT * FROM datasources WHERE workspace_id = ? AND name = 'primary'", (cat.ws,)).fetchone()
+            if row is None:
+                return {"connected": False, "model_version": cat.head()}
+            ds = get_datasource(cat)
+            details = [{"label": k.replace("_", " ").capitalize(), "value": str(v)} for k, v in sorted(ds.options.items())
+                       if k in {"host", "port", "dbname", "user", "project", "location", "impersonate_service_account"}]
+            if ds.kind == "duckdb":
+                details.append({"label": "File", "value": os.path.basename(str(ds.options.get("path", "")))})
+            if ds.secret_ref:
+                details.append({"label": "Credential", "value": f"Secret Manager reference {ds.secret_ref.id[:8]} (version {ds.secret_ref.version})"})
+            checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            try:
+                layer.execute("SELECT 1", layer.limits, "q_health")
+                details.append({"label": "Status", "value": "reachable"})
+            except ModelError as e:
+                details.append({"label": "Status", "value": f"unreachable ({e.code})"})
+            return {"connected": True, "kind": ds.kind, "name": ds.options.get("dbname") or ds.options.get("project") or ds.name,
+                    "details": details, "connected_at": _iso(row["created_at"]), "connected_by": principal_names(row["created_by"], None)["user"],
+                    "last_checked_at": checked, "model_version": cat.head()}
 
     def admin_person(c: Caller) -> None:
         if not c.at_least("admin"):
@@ -340,25 +343,27 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
     def put_warehouse(body: Annotated[WarehouseInput, Field(discriminator="kind")], c: Caller = Depends(person),
                       raw: Any = Depends(caller_dependency)) -> dict[str, Any]:  # raw: the API's caller, for record_secret's RLS
         admin_person(c)
-        _, layer, _ = layer_ctx(c)
-        ds, secret = candidate(raw, body)
-        out = probe(ds, secret)  # never store credentials that don't work
         if secret_store is None or record_secret is None:
             raise http_error("data_unavailable", "saving warehouse credentials needs the API's secret store")
-        old = layer.catalog.db.execute("SELECT secret_resource, secret_version FROM datasources WHERE workspace_id = ? AND name = 'primary'",
-                                       (layer.catalog.ws,)).fetchone()
+        ds, secret = candidate(raw, body)
+        out = probe(ds, secret)  # never store credentials that don't work
         secret_id = f"ws-{c.workspace_id}-warehouse_credential-{uuid.uuid4()}"
         resource, version = secret_store.put(secret_id, secret, {"workspace": str(c.workspace_id), "kind": "warehouse_credential"})
         try:
-            ref_id = record_secret(raw, kind="warehouse_credential", label="warehouse-primary",
-                                   resource_name=resource, version=version, last4=secret[-4:],
-                                   fingerprint=hashlib.sha256(secret.encode()).digest())
-            ref = SecretRef(id=str(ref_id), resource_name=resource, version=str(version))
-            guard(lambda: register_datasource(layer.catalog, ds.model_copy(update={"secret_ref": ref}), c.principal,
-                                              verified_projects(raw)))
+            with opened(c) as (_, layer, _):  # commits when this block ends (one host transaction)
+                old = layer.catalog.db.execute(
+                    "SELECT secret_resource, secret_version FROM datasources WHERE workspace_id = ? AND name = 'primary'",
+                    (layer.catalog.ws,)).fetchone()
+                ref_id = record_secret(raw, kind="warehouse_credential", label="warehouse-primary",
+                                       resource_name=resource, version=version, last4=secret[-4:],
+                                       fingerprint=hashlib.sha256(secret.encode()).digest())
+                ref = SecretRef(id=str(ref_id), resource_name=resource, version=str(version))
+                guard(lambda: register_datasource(layer.catalog, ds.model_copy(update={"secret_ref": ref}), c.principal,
+                                                  verified_projects(raw)))
         except BaseException:
             secret_store.destroy(resource, version)  # never leave an unreferenced credential behind
             raise
+        # Only after the new reference is committed: retire the previous credential version.
         if old and old["secret_resource"] and old["secret_resource"] != resource:
             secret_store.destroy(old["secret_resource"], old["secret_version"])
         forget = getattr(get_tools(), "forget_workspace", None)
@@ -370,26 +375,26 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
 
     @router.get("/cubes")
     def list_cubes(c: Caller = Depends(reader)) -> list[dict[str, Any]]:
-        _, layer, ctx = layer_ctx(c)
-        model = layer.catalog.load()
-        admin = c.at_least("admin")
-        return [cube_body(cube, model, layer, c, ctx, admin) for cube in model.cubes.values()]
+        with opened(c) as (_, layer, ctx):
+            model = layer.catalog.load()
+            admin = c.at_least("admin")
+            return [cube_body(cube, model, layer, c, ctx, admin) for cube in model.cubes.values()]
 
     @router.get("/cubes/{name}")
     def get_cube(name: str, c: Caller = Depends(reader)) -> dict[str, Any]:
-        _, layer, ctx = layer_ctx(c)
-        model = layer.catalog.load()
-        if name not in model.cubes:
-            raise http_error("not_found", f"no cube {name!r}")
-        return cube_body(model.cubes[name], model, layer, c, ctx, c.at_least("admin"))
+        with opened(c) as (_, layer, ctx):
+            model = layer.catalog.load()
+            if name not in model.cubes:
+                raise http_error("not_found", f"no cube {name!r}")
+            return cube_body(model.cubes[name], model, layer, c, ctx, c.at_least("admin"))
 
     # ---- migrations
 
     @router.get("/migrations")
     def list_migrations(c: Caller = Depends(reader)) -> list[dict[str, Any]]:
-        _, layer, _ = layer_ctx(c)
-        recs = sorted(layer.catalog.migrations(), key=lambda r: str(r["created_at"]), reverse=True)
-        return [migration_body(r, layer.catalog, principal_names) for r in recs]
+        with opened(c) as (_, layer, _):
+            recs = sorted(layer.catalog.migrations(), key=lambda r: str(r["created_at"]), reverse=True)
+            return [migration_body(r, layer.catalog, principal_names) for r in recs]
 
     def one(layer, mid: str) -> dict[str, Any]:
         rec = layer.catalog.migration(mid)
@@ -399,25 +404,25 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
 
     @router.get("/migrations/{mid}")
     def get_migration(mid: str, c: Caller = Depends(reader)) -> dict[str, Any]:
-        _, layer, _ = layer_ctx(c)
-        return migration_body(one(layer, mid), layer.catalog, principal_names)
+        with opened(c) as (_, layer, _):
+            return migration_body(one(layer, mid), layer.catalog, principal_names)
 
     def decide(mid: str, action: str, body: Optional[DecisionBody], c: Caller) -> dict[str, Any]:
         body = body or DecisionBody()
-        t, layer, _ = layer_ctx(c)
-        rec = one(layer, mid)
-        if rec["status"] not in {"proposed", "approved"}:
-            raise http_error("conflict", f"{mid} is already {rec['status']}")
-        if action == "reject":
-            if not c.at_least("developer"):
-                raise http_error("forbidden", "rejecting a proposal needs the developer role")
-            guard(lambda: layer.runner.reject(mid, c.principal, body.note or "", str(c.user_id) if c.user_id else None))
-        else:
-            if rec["status"] == "proposed":
-                guard(lambda: t.approve(mid, c))
-            guard(lambda: t.apply(mid, c, allow_breaking=body.allow_breaking))
-        log_event(f"data.migration.{action}", migration_id=mid, workspace_id=str(c.workspace_id), via="console")
-        return migration_body(one(layer, mid), layer.catalog, principal_names)
+        with opened(c) as (t, layer, _):
+            rec = one(layer, mid)
+            if rec["status"] not in {"proposed", "approved"}:
+                raise http_error("conflict", f"{mid} is already {rec['status']}")
+            if action == "reject":
+                if not c.at_least("developer"):
+                    raise http_error("forbidden", "rejecting a proposal needs the developer role")
+                guard(lambda: layer.runner.reject(mid, c.principal, body.note or "", str(c.user_id) if c.user_id else None))
+            else:
+                if rec["status"] == "proposed":
+                    guard(lambda: t.approve(mid, c))
+                guard(lambda: t.apply(mid, c, allow_breaking=body.allow_breaking))
+            log_event(f"data.migration.{action}", migration_id=mid, workspace_id=str(c.workspace_id), via="console")
+            return migration_body(one(layer, mid), layer.catalog, principal_names)
 
     @router.post("/migrations/{mid}:apply")
     def apply_migration(mid: str, body: Optional[DecisionBody] = None, c: Caller = Depends(person)) -> dict[str, Any]:

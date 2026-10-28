@@ -16,6 +16,7 @@ import hashlib
 import re
 import sqlite3
 import threading
+import uuid
 import zlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -136,7 +137,12 @@ class Db:
                 return Result([], cur.rowcount)
             names = [d[0] for d in cur.description]
             rows = cur.fetchall()  # tuples, or dicts on a host connection with dict_row
-            return Result([Row(names, [r[n] for n in names] if isinstance(r, dict) else r) for r in rows], cur.rowcount)
+            out = []
+            for r in rows:
+                values = [r[n] for n in names] if isinstance(r, dict) else r
+                # UUID columns (the shared layout's workspace_id) come back as text, as on every other layout
+                out.append(Row(names, [str(v) if isinstance(v, uuid.UUID) else v for v in values]))
+            return Result(out, cur.rowcount)
 
     def script(self, sql: str) -> None:
         with self._lock:

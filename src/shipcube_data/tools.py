@@ -18,10 +18,14 @@ require a person's console session.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import functools
+
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, ContextManager, Iterator, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -136,12 +140,52 @@ def default_approval_url(workspace_id: UUID, migration_id: str) -> str:
     return f"https://console.shipcube.dev/w/{workspace_id}/data/migrations/{migration_id}"
 
 
+# The data layer of the session in progress on this thread: (workspace_id, DataLayer).
+_current: contextvars.ContextVar[Optional[tuple[str, DataLayer]]] = contextvars.ContextVar("shipcube_data_session", default=None)
+
+
+def _in_session(fn):
+    """Run a console action inside one session (one host transaction) for its caller."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        caller = kwargs.get("caller") or next(a for a in args if isinstance(a, Caller))
+        with self.session(caller):
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class DataTools:
-    def __init__(self, layer_for: Callable[[UUID], DataLayer],
+    """The data_ tools and the console's actions.
+
+    Pass `layer_for(workspace_id) -> DataLayer` (a catalog with its own connections), or
+    `session(caller) -> context manager of DataLayer` when every call must run in a host
+    transaction scoped to the verified caller (ShipCube's API: the shared catalog under RLS, in
+    `db.tx(caller)`). Each tool call or console action is one session; nested calls join it.
+    """
+
+    def __init__(self, layer_for: Optional[Callable[[UUID], DataLayer]] = None,
                  approval_url: Callable[[UUID, str], str] = default_approval_url,
-                 drafter: Optional[DraftProvider] = None):
-        self.layer_for, self.approval_url = layer_for, approval_url
+                 drafter: Optional[DraftProvider] = None,
+                 session: Optional[Callable[[Caller], ContextManager[DataLayer]]] = None):
+        if layer_for is None and session is None:
+            raise ValueError("DataTools needs layer_for or session")
+        self.layer_for, self.approval_url, self._session = layer_for, approval_url, session
         self.drafter = drafter or MuseDrafter.from_env()
+
+    @contextlib.contextmanager
+    def session(self, caller: Caller) -> Iterator[DataLayer]:
+        ws = str(caller.workspace_id)
+        current = _current.get()
+        if current is not None and current[0] == ws:  # nested: join the session in progress
+            yield current[1]
+            return
+        cm = self._session(caller) if self._session else contextlib.nullcontext(self.layer_for(caller.workspace_id))  # type: ignore[misc]
+        with cm as layer:
+            token = _current.set((ws, layer))
+            try:
+                yield layer
+            finally:
+                _current.reset(token)
 
     # ------------------------------------------------------------ registry
 
@@ -163,7 +207,8 @@ class DataTools:
             raise ToolError("forbidden", f"{name} needs the {tool.scope} scope on your token")
         try:
             parsed = tool.args.model_validate(args or {})
-            return getattr(self, f"_{tool.name}")(parsed, caller)
+            with self.session(caller):
+                return getattr(self, f"_{tool.name}")(parsed, caller)
         except ValidationError as e:
             first = e.errors()[0]
             where = ".".join(str(x) for x in first["loc"])
@@ -179,8 +224,14 @@ class DataTools:
             raise ToolError("internal_error", f"the data layer hit an unexpected {type(e).__name__}",
                             f"logged as {incident}; tell the workspace admin") from None
 
+    def _layer(self, caller: Caller) -> DataLayer:
+        current = _current.get()
+        if current is None or current[0] != str(caller.workspace_id):
+            raise RuntimeError("no data session for this caller")  # every entry point opens one
+        return current[1]
+
     def _ctx(self, caller: Caller):
-        layer = self.layer_for(caller.workspace_id)
+        layer = self._layer(caller)
         return layer, security_context(caller, layer.catalog)
 
     # ------------------------------------------------------------ tools
@@ -238,6 +289,7 @@ class DataTools:
         if not caller.is_human_session:
             raise ToolError("forbidden", f"{what} is done by a person in the console, not with a token")
 
+    @_in_session
     def apply(self, migration_id: str, caller: Caller, *, allow_breaking: bool = False) -> dict[str, Any]:
         """Apply an approved migration from the console (or the API acting on a console click)."""
         self._require_console(caller, "applying a migration")
@@ -253,6 +305,7 @@ class DataTools:
                 hint = f"approve it first: {self.approval_url(caller.workspace_id, migration_id)}"
             raise ToolError(e.code, str(e), hint) from None
 
+    @_in_session
     def register_datasource(self, caller: Caller, name: str, kind: str, secret_ref: Optional[dict[str, Any]] = None,
                             options: Optional[dict[str, Any]] = None,
                             verified_projects: Optional[list[str]] = None) -> dict[str, Any]:
@@ -260,7 +313,7 @@ class DataTools:
         self._require_console(caller, "connecting a warehouse")
         if not caller.at_least("admin"):
             raise ToolError("forbidden", "connecting a warehouse needs the admin role")
-        layer = self.layer_for(caller.workspace_id)
+        layer = self._layer(caller)
         security_context(caller, layer.catalog)  # workspace check
         try:
             ds = Datasource(name=name, kind=kind, secret_ref=SecretRef(**secret_ref) if secret_ref else None, options=options or {})
@@ -271,6 +324,7 @@ class DataTools:
         except ModelError as e:
             raise ToolError(e.code, str(e), e.hint) from None
 
+    @_in_session
     def approve(self, migration_id: str, caller: Caller) -> dict[str, Any]:
         """Approve a proposal from a human console session. Admins approve anything; developers only additive changes."""
         self._require_console(caller, "approving a migration")

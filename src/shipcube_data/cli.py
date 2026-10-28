@@ -8,6 +8,7 @@
   shipcube-data query    --catalog catalog.db --warehouse demo.duckdb --tenant acme '{"measures": ["orders.count"]}'
   shipcube-data sql      --catalog catalog.db --tenant acme --dialect bigquery '{...}'
   shipcube-data catalog-migrate --catalog postgresql://... --workspace <uuid>
+  shipcube-data catalog-migrate --catalog postgresql://.../shipcube --shared   # production: as the migration role
   shipcube-data seed  [--force]   # local stack, configured from env (see shipcube_data/local.py)
   shipcube-data smoke             # list cubes → describe → query → search → propose → agent cannot apply
 
@@ -57,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--attr", action="append", default=[], help="security context attribute key=value")
         s.add_argument("--dialect", default=None)
         s.add_argument("--dry-run", action="store_true")
+        s.add_argument("--shared", action="store_true", default=os.environ.get("SHIPCUBE_DATA_CATALOG_LAYOUT") == "shared",
+                       help="the shared catalog in ShipCube's database (schema catalog, RLS); $SHIPCUBE_DATA_CATALOG_LAYOUT=shared")
         s.add_argument("--actor", default=os.environ.get("USER"))
         s.add_argument("arg", nargs="?")
     a = p.parse_args(argv)
@@ -94,11 +97,11 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "catalog-migrate":
             from .db import Db, workspace_schema
 
-            db = Db(a.catalog, schema=workspace_schema(a.workspace))
+            db = Db(a.catalog, shared=True) if a.shared else Db(a.catalog, schema=workspace_schema(a.workspace))
             applied = db.migrate_schema()
             print(f"catalog schema {db.schema or a.catalog}: applied {applied or 'nothing (up to date)'}")
             return 0
-        cat = Catalog(a.catalog, workspace_id=a.workspace)
+        cat = Catalog(a.catalog, workspace_id=a.workspace, shared=a.shared, migrate=not a.shared)
         runner = Runner(cat)
         if a.cmd == "status":
             for row in runner.status(load_dir(a.dir)):
