@@ -1,6 +1,6 @@
 [project]
 name = "shipcube-data"
-version = "0.1.0"
+version = "0.2.0"
 description = "ShipCube's data layer: a semantic layer whose models live in a catalog database and change through model migrations."
 readme = "README.md"
 license = { text = "Apache-2.0" }

@@ -59,7 +59,7 @@ class Db:
 
     kind: str
 
-    def __init__(self, url: str, schema: Optional[str] = None):
+    def __init__(self, url: str, schema: Optional[str] = None, create_schema: bool = True):
         self.url = url
         self._depth = 0
         self._lock = threading.RLock()
@@ -71,7 +71,11 @@ class Db:
             if not _SCHEMA_RE.match(self.schema):
                 raise ModelError(f"invalid catalog schema name {self.schema!r}")
             self.conn = psycopg.connect(url, autocommit=True, connect_timeout=10)
-            self.conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+            if create_schema:
+                self.conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+            elif not self.conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.schema,)).fetchone():
+                self.conn.close()
+                raise ModelError(f"no catalog for this workspace (schema {self.schema} does not exist)", "catalog_not_migrated")
             self.conn.execute(f'SET search_path TO "{self.schema}"')
         else:
             self.kind = "sqlite"

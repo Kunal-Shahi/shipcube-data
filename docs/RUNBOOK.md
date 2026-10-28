@@ -24,6 +24,10 @@ Everything environment-specific comes from environment variables. Secrets come f
 | `SHIPCUBE_DATA_MAX_ROWS` | `10000` | Row cap per query; larger `limit`s are refused |
 | `SHIPCUBE_DATA_MAX_BYTES_BILLED` | `10737418240` (10 GiB) | BigQuery per-query bytes cap (dry run and `maximum_bytes_billed`) |
 | `SHIPCUBE_DATA_MAX_PG_COST` | `5000000` | Postgres planner-cost cap (from `EXPLAIN`) |
+| `SHIPCUBE_DATA_SECRET_PROJECT` | – | The only Secret Manager project datasource secrets may live in (e.g. `shipcube-control-ks`). Secrets must also be named `ws-<workspace id>-…`. |
+| `SHIPCUBE_DATA_ALLOWED_DB_HOSTS` | – | Private database hosts that are allowed anyway (comma-separated). Everything resolving to a private, loopback or link-local address is refused otherwise. |
+| `SHIPCUBE_DEV_MODE` | unset | `1` allows DuckDB warehouses and `projects/local` secrets. Local stack only. |
+| `SHIPCUBE_DATA_WORKSPACE` | – | Local stack: the workspace `shipcube-data seed` seeds (see [LOCAL.md](LOCAL.md)) |
 | `SHIPCUBE_DATA_LOG_LEVEL` | `WARNING` (CLI) | Log level for the CLI. Services call `obs.configure_logging("INFO")`. |
 | `META_API_KEY` | – | Enables Muse Spark drafting. Secret `projects/shipcube-control-ks/secrets/meta-api-key`. |
 | `META_API_BASE_URL` | `https://api.meta.ai/v1` | Meta Model API base URL |

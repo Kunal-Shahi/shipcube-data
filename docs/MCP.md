@@ -61,15 +61,15 @@ except ToolError as e:
 | `data_describe_cube` | `data:read` | `DataLayer.describe_cube` |
 | `data_query` | `data:read` | `DataLayer.query` / `DataLayer.compile` |
 | `data_search_values` | `data:read` | `DataLayer.search_values` |
-| `data_propose_migration` | `data:write` | Drafter (optional), then `Runner.propose` |
+| `data_propose_migration` | `data:migrate` (`data:write` accepted as an alias) | Drafter (optional), then `Runner.propose` |
 
 These console and API actions need a person's console session (`Caller.via == "console"`, no token):
 
 | Function | Who | Does |
 |---|---|---|
-| `DataTools.approve(id, caller)` | admin, or developer for `additive` migrations; never the proposer's own principal | Marks a proposal approved |
+| `DataTools.approve(id, caller)` | admin; a developer only for `additive` migrations that don't widen exposure (in practice metadata and segments). Never the person who proposed it. | Marks a proposal approved |
 | `DataTools.apply(id, caller, allow_breaking=False)` | developer; `allow_breaking=True` needs admin | Re-plans (conflicts, impact), then applies an approved migration |
-| `DataTools.register_datasource(caller, name, kind, secret_ref, options)` | admin | Connects a warehouse from a stored secret reference |
+| `DataTools.register_datasource(caller, name, kind, secret_ref, options, verified_projects)` | admin | Connects a warehouse from a stored secret reference (see the guards below) |
 | `Runner.rollback(...)` | admin (console or CLI) | Pops the head model version |
 
 There is also an optional `raw_sql` (L3). It needs the `data:raw` scope and a workspace setting, is off by default, and is not in `specs()` yet.
@@ -96,11 +96,11 @@ The library also checks, before anything runs:
 
 | Rule | Error |
 |---|---|
-| The token has the tool's scope (`data:read` or `data:write`). Console and app requests are bounded by role and IAP instead. | `forbidden` |
+| The token has the tool's scope (`data:read` or `data:migrate`). Console and app requests are bounded by role and IAP instead. | `forbidden` |
 | The caller is a workspace member, or is reading through an app. | `forbidden` |
 | The catalog belongs to the caller's workspace. | `forbidden` |
 | `data_propose_migration` needs `developer` or higher. | `forbidden` |
-| Approving needs a human console session, not a token. Developers may approve `additive` migrations; `change` and `breaking` migrations need `admin`. The approver must be a different principal from the proposer. The token's owner may approve their own agent's proposal from the console. | `forbidden` |
+| Approving needs a human console session, not a token. The approver must be a different **person** from the proposer: an agent's token and its owner's console session are the same person. Developers may approve only `additive` migrations that don't widen exposure; anything that can make more data visible (new cubes, members or joins, `change_sql`, re-binding schemas, revoking grants, dropping row policies) needs `admin`. | `forbidden` |
 
 Data roles and attributes are workspace access settings, not semantic-model changes, so they live outside migrations. The catalog's `assign_role`, `unassign_role` and `set_attribute` record every change in `audit_log`. The console's "Data access" page writes them.
 
@@ -328,17 +328,18 @@ The tool description tells agents to use `query` first. `raw_sql` is for one-off
 Credentials never pass through an agent or this library's storage:
 
 1. The console stores the credential in Secret Manager and creates a `secret_refs` row (security schema): `id`, `resource_name`, and a pinned `version`.
-2. The API calls `DataTools.register_datasource(caller, "primary", "postgres", secret_ref={"id": …, "resource_name": "projects/…/secrets/…", "version": "3"}, options={"host": …, "database": …})`. This validates three things:
-   - the kind is one of DuckDB, Postgres, BigQuery or ClickHouse;
-   - the version is a pinned number, not `latest`;
-   - no option name looks like a credential.
+2. The API calls `DataTools.register_datasource(caller, "primary", "postgres", secret_ref={"id": …, "resource_name": "projects/<secrets project>/secrets/ws-<workspace id>-…", "version": "3"}, options={"host": …, "dbname": …, "user": …}, verified_projects=[…])`. It checks, and checks again at every connect:
+   - **Secrets belong to the workspace.** The secret must be in `SHIPCUBE_DATA_SECRET_PROJECT`, be named `ws-<workspace id>-…`, and use a pinned version, not `latest`. No option name may look like a credential.
+   - **Postgres hosts are public.** Hosts that resolve to private, loopback, link-local or reserved addresses, and sockets such as `/cloudsql/…`, are refused unless they are listed in `SHIPCUBE_DATA_ALLOWED_DB_HOSTS`. TLS is `sslmode=verify-full` unless the host is allow-listed. A full URL stored in the secret gets the same checks.
+   - **BigQuery runs as the customer.** `options.project` must be in `verified_projects`, which the API passes from the workspace's linked and verified GCP projects. Credentials are a service-account key in Secret Manager, or `impersonate_service_account`, a service account in that same project that ShipCube's runtime identity can impersonate. ShipCube's own identity is never used on a customer project.
+   - **DuckDB is local development only** (`SHIPCUBE_DEV_MODE=1`), and its connections are sealed: no file, network or extension access, and the configuration is locked.
 
    It also refuses to switch the dialect under an existing model. It stores only the reference, sets the catalog dialect, and writes `data.datasource.register` to the audit log.
-3. At query time, `DataLayer.from_catalog(catalog, resolve_secret, connectors)` calls `resolve_secret(SecretRef)` (the API's Secret Manager access) and a connector factory per kind. DuckDB is built in. The API supplies the Postgres, BigQuery and ClickHouse connectors, which run with read-only warehouse roles.
+3. At query time, `DataLayer.from_catalog(catalog, resolve_secret, connectors)` re-checks the datasource, then calls `resolve_secret(SecretRef)`. `shipcube_data.secrets.gcp_secret_resolver()` reads Secret Manager with the runtime service account. Built-in connectors: Postgres, BigQuery and DuckDB (dev). `shipcube_data.local.tools_from_env()` wires all of this from environment variables; see [LOCAL.md](LOCAL.md).
 
 ## Wiring checklist (for the ShipCube MCP server)
 
-- [ ] Add the git dependency. Register `DataTools.specs()` (prefixed `data_`) as tools. The input schemas are already JSON Schema.
+- [ ] Add the git dependency. Build the tools with `shipcube_data.local.tools_from_env()` and register `tools.specs()` (prefixed `data_`). The input schemas are already JSON Schema.
 - [ ] Pass `MuseDrafter(muse_client)` once the AI gateway exposes Muse Spark. Until then the default `RuleDrafter` is used.
 - [ ] Build `Caller` from the verified token, membership and workspace (see the identity section above), never from tool arguments.
 - [ ] Return `ToolError.to_dict()` as the MCP error payload.
@@ -346,4 +347,4 @@ Credentials never pass through an agent or this library's storage:
 - [ ] Add a console "Connect warehouse" form that writes the secret to Secret Manager, then calls `DataTools.register_datasource`.
 - [ ] Add a console "Data access" page for data roles and attributes (`Catalog.assign_role` / `set_attribute`).
 - [ ] Register each deployed app's typed queries as `saved_queries` (name, app, tenant, roles), so impact analysis has something to check.
-- [ ] Settle the scope names `data:read`/`data:write` with the console's scope list.
+- [x] Scope names: `data:read` and `data:migrate` (security's names); `data:write` is still accepted.

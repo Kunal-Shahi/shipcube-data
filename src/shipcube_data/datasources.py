@@ -247,6 +247,8 @@ def local_secret_resolver(ref: SecretRef) -> str:
         raise ModelError("the local secret resolver only serves projects/local secrets in SHIPCUBE_DEV_MODE", "forbidden")
     var = "SHIPCUBE_DATA_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", m["name"]).upper()
     value = os.environ.get(var)
+    if value is None and m["name"].endswith("-warehouse"):  # the local stack's one warehouse
+        value = os.environ.get("SHIPCUBE_DATA_WAREHOUSE_URL")
     if value is None:
         raise ModelError(f"local secret {ref.resource_name} is not set (env {var})", "no_datasource")
     return value

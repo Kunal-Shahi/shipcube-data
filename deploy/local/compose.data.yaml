@@ -1,0 +1,47 @@
+# shipcube-data on ShipCube's local stack. Merge into deploy/local/compose.yaml in Kunal-Shahi/shipcube.
+#
+# - `data-seed` is a one-shot job: it creates the databases if missing, loads the Olist-shaped demo
+#   warehouse, applies the catalog-schema and model migrations for SHIPCUBE_DATA_WORKSPACE, registers
+#   the warehouse and maps demo Google domains to tenants. Idempotent; runs on every `up`.
+# - `mcp` gets the same environment and mounts the five data_ tools with
+#   `shipcube_data.local.tools_from_env()`.
+# - `make smoke` can run: docker compose run --rm data-seed shipcube-data smoke
+#
+# The image is any image with shipcube-data installed. The MCP image already has it (the `data` extra).
+
+x-shipcube-data-env: &shipcube-data-env
+  SHIPCUBE_DEV_MODE: "1"                                   # allows DuckDB and projects/local secrets
+  SHIPCUBE_DATA_CATALOG_URL: postgresql://postgres:postgres@postgres:5432/shipcube_data
+  SHIPCUBE_DATA_WORKSPACE: ${SHIPCUBE_LOCAL_WORKSPACE_ID:?id of the workspace the local bootstrap creates}
+  SHIPCUBE_DATA_WAREHOUSE: ${SHIPCUBE_DATA_WAREHOUSE:-duckdb}  # or postgres
+  SHIPCUBE_DATA_DUCKDB_PATH: /data/olist.duckdb
+  SHIPCUBE_DATA_WAREHOUSE_URL: postgresql://postgres:postgres@postgres:5432/warehouse?sslmode=disable
+  SHIPCUBE_DATA_ALLOWED_DB_HOSTS: postgres                  # the stack's own Postgres is private; allow it explicitly
+  SHIPCUBE_DATA_DEMO_TENANTS: ${SHIPCUBE_DATA_DEMO_TENANTS:-example.com=acme,globex.test=globex}
+  SHIPCUBE_DATA_QUERY_TIMEOUT_S: "30"
+  SHIPCUBE_DATA_MAX_ROWS: "10000"
+  # META_API_KEY: set it to let data_propose_migration draft with Muse Spark; rules otherwise
+
+services:
+  data-seed:
+    image: ${SHIPCUBE_MCP_IMAGE:-shipcube-mcp:local}
+    command: ["shipcube-data", "seed"]
+    environment: *shipcube-data-env
+    volumes:
+      - shipcube-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  mcp:
+    environment:
+      <<: *shipcube-data-env
+    volumes:
+      - shipcube-data:/data:ro
+    depends_on:
+      data-seed:
+        condition: service_completed_successfully
+
+volumes:
+  shipcube-data:

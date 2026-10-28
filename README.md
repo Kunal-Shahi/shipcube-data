@@ -12,6 +12,7 @@ Part of [ShipCube](https://github.com/Kunal-Shahi/shipcube).
 - [docs/MIGRATIONS.md](docs/MIGRATIONS.md) covers the migration vocabulary, ordering, idempotency, rollback, conflict detection, dry-run with impact analysis, and how agents propose migrations that humans approve.
 - [docs/QUERY.md](docs/QUERY.md) covers the query language (L0 typed, L1 operators, L2 stages, L3 raw SQL) and dialects.
 - [docs/MCP.md](docs/MCP.md) covers the MCP tools exposed to coding agents.
+- [docs/LOCAL.md](docs/LOCAL.md) covers running on ShipCube's local stack: compose services, env vars, `shipcube-data seed` and `shipcube-data smoke`.
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) covers configuration (environment variables), deploying (catalog-schema migrations), operating (logs, metrics, common incidents) and known limits.
 
 ## Use it from ShipCube
@@ -112,7 +113,9 @@ src/shipcube_data/
   warehouses.py  DuckDB / Cloud SQL Postgres / BigQuery adapters with timeouts, row limits, cost guards
   obs.py         JSON logs, query and request ids, metrics hook
   testing.py     test doubles (MockMuse); never used on production paths
-  datasources.py warehouse connections from secret references; connector registry
+  datasources.py warehouse connections from secret references; host/secret/project guards; connectors
+  secrets.py     Secret Manager resolver (production), local resolver (DEV_MODE)
+  local.py       local stack: seed, tools_from_env() for the MCP server, smoke
   demo.py        Olist-shaped DuckDB warehouse
 examples/olist/migrations/   the demo model as migrations
 tests/

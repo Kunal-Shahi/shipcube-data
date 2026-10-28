@@ -171,7 +171,7 @@ Data roles and attributes are **not** versioned or migration-managed. They are a
 
 ### 4.3 Why SCD2
 
-- **Point-in-time models.** `load(version=v)` selects rows with `since <= v AND (until IS NULL OR until > v)`. A query can pin `model_version` to keep its meaning while a migration rolls out. `test_change_sql_is_versioned_and_pinnable` covers this.
+- **Point-in-time models.** `load(version=v)` selects rows with `since <= v AND (until IS NULL OR until > v)`. A query can pin `model_version` to keep a member's *definition* while a migration rolls out. `test_change_sql_is_versioned_and_pinnable` covers this. A pin never brings back old access rules: grants, row policies, schema bindings, joins and partitions always come from head (`engine.pin_definitions`; red-team issue #2).
 - **Generic, exact rollback.** To undo the head version `v`:
   - delete rows with `since = v`;
   - set `until = NULL` on rows with `until = v`;
@@ -191,7 +191,7 @@ Data roles and attributes are **not** versioned or migration-managed. They are a
 
 The compiler is in `compiler.py`. Its steps, in order:
 
-1. **Load the model** at the head version, or at the query's `model_version`.
+1. **Load the model** at head. If the query pins `model_version`, take only member definitions (SQL, aggregation, filter) from that version, for members that still exist at head; access rules always come from head.
 2. **Resolve members.** For each `cube.member`:
    - Follow rename aliases and warn that the query should be updated.
    - Warn on deprecation, naming `replaced_by`.
@@ -349,7 +349,7 @@ sha256(
   - the impact on saved queries.
 
   Conflicts are checked before ops are applied. So if one migration renames a member while another edits it, the second gets `conflict, rebase` rather than a confusing op error. `tests/test_concurrency.py` races real connections on both backends.
-- **Warehouses and guardrails.** Credentials are referenced through `secret_refs` and resolved from Secret Manager at connect time. For BigQuery, the runtime service account (ADC) is preferred. Every query, L0 to L3, runs through an adapter that enforces `QueryLimits`:
+- **Warehouses and guardrails.** Credentials are referenced through `secret_refs` and resolved from Secret Manager at connect time. For BigQuery, the customer's service account is impersonated (or its key is used); ShipCube's own identity never queries a customer project. Every query, L0 to L3, runs through an adapter that enforces `QueryLimits`:
 
   | Guard | Cloud SQL Postgres | BigQuery | DuckDB (dev) |
   |---|---|---|---|

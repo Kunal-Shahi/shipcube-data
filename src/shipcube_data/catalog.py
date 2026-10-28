@@ -110,7 +110,7 @@ class Catalog:
     def __init__(self, url: str | Path = ":memory:", dialect: str = "duckdb", workspace_id: Optional[str] = None,
                  migrate: bool = True):
         self.url = str(url)
-        self.db = Db(self.url, schema=workspace_schema(str(workspace_id) if workspace_id else None))
+        self.db = Db(self.url, schema=workspace_schema(str(workspace_id) if workspace_id else None), create_schema=migrate)
         if migrate:
             self.db.migrate_schema()
         else:

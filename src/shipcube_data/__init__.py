@@ -15,7 +15,7 @@ from .migrate import Runner
 from .model import ModelError
 from .tools import DataTools, ToolError
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "Caller", "Catalog", "DataLayer", "DataTools", "Datasource", "ModelError", "MuseDrafter",
     "RuleDrafter", "Runner", "SecretRef", "SecurityContext", "ToolError", "register_datasource", "security_context",

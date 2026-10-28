@@ -8,6 +8,8 @@
   shipcube-data query    --catalog catalog.db --warehouse demo.duckdb --tenant acme '{"measures": ["orders.count"]}'
   shipcube-data sql      --catalog catalog.db --tenant acme --dialect bigquery '{...}'
   shipcube-data catalog-migrate --catalog postgresql://... --workspace <uuid>
+  shipcube-data seed  [--force]   # local stack, configured from env (see shipcube_data/local.py)
+  shipcube-data smoke             # list cubes → describe → query → search → propose → agent cannot apply
 
 `--catalog` is a SQLite path or a postgresql:// URL (default: $SHIPCUBE_DATA_CATALOG_URL, else catalog.db).
 `--workspace` selects the workspace's catalog schema on Postgres (default: $SHIPCUBE_DATA_WORKSPACE_ID).
@@ -40,6 +42,9 @@ def _print(obj: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="shipcube-data")
     sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("seed", "smoke"):
+        s = sub.add_parser(name, help="local stack: seed the demo warehouse and catalog / run the tool smoke test")
+        s.add_argument("--force", action="store_true", help="seed: rebuild the DuckDB file even if it exists")
     for name in ("status", "dry-run", "apply", "rollback", "query", "sql", "demo", "catalog-migrate"):
         s = sub.add_parser(name)
         s.add_argument("--catalog", default=os.environ.get("SHIPCUBE_DATA_CATALOG_URL", "catalog.db"))
@@ -57,6 +62,17 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(os.environ.get("SHIPCUBE_DATA_LOG_LEVEL", "WARNING"), stream=sys.stderr)
 
     try:
+        if a.cmd in {"seed", "smoke"}:
+            from . import local
+
+            settings = local.Settings.from_env()
+            if a.cmd == "seed":
+                _print(local.seed(settings, force=a.force))
+                return 0
+            steps = local.smoke(settings)
+            failed = [st.name for st in steps if not st.ok]
+            print(f"smoke: {len(steps) - len(failed)}/{len(steps)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
+            return 1 if failed else 0
         if a.cmd == "demo":
             import duckdb
 
