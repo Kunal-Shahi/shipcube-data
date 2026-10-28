@@ -394,12 +394,8 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
         _, layer, _ = layer_ctx(c)
         return migration_body(one(layer, mid), layer.catalog, principal_names)
 
-    @router.post("/migrations/{mid_action}")
-    def decide(mid_action: str, body: Optional[DecisionBody] = None, c: Caller = Depends(person)) -> dict[str, Any]:
+    def decide(mid: str, action: str, body: Optional[DecisionBody], c: Caller) -> dict[str, Any]:
         body = body or DecisionBody()
-        mid, _, action = mid_action.rpartition(":")
-        if action not in {"apply", "reject"} or not mid:
-            raise http_error("not_found", "use POST /v1/data/migrations/{id}:apply or :reject")
         t, layer, _ = layer_ctx(c)
         rec = one(layer, mid)
         if rec["status"] not in {"proposed", "approved"}:
@@ -414,5 +410,13 @@ def data_router(caller_dependency: Callable[..., Any], tools: Optional[DataTools
             guard(lambda: t.apply(mid, c, allow_breaking=body.allow_breaking))
         log_event(f"data.migration.{action}", migration_id=mid, workspace_id=str(c.workspace_id), via="console")
         return migration_body(one(layer, mid), layer.catalog, principal_names)
+
+    @router.post("/migrations/{mid}:apply")
+    def apply_migration(mid: str, body: Optional[DecisionBody] = None, c: Caller = Depends(person)) -> dict[str, Any]:
+        return decide(mid, "apply", body, c)
+
+    @router.post("/migrations/{mid}:reject")
+    def reject_migration(mid: str, body: Optional[DecisionBody] = None, c: Caller = Depends(person)) -> dict[str, Any]:
+        return decide(mid, "reject", body, c)
 
     return router

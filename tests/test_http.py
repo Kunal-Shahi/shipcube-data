@@ -136,7 +136,7 @@ def test_migration_review_and_person_only_apply(api):
     assert done["status"] == "applied" and done["applied"]["version"] == 6
     assert api("GET", "/warehouse", "bob-dev").json()["model_version"] == 6
     assert api("POST", f"/migrations/{mid}:apply", "carl-admin").status_code == 409
-    assert api("POST", f"/migrations/{mid}:launch", "carl-admin").status_code == 404
+    assert api("POST", f"/migrations/{mid}:launch", "carl-admin").status_code in (404, 405)
 
 
 def test_reject_with_note(api):
