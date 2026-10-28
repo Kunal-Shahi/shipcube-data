@@ -279,3 +279,15 @@ def lock_key(name: str) -> int:
 
 def workspace_schema(workspace_id: Optional[str]) -> str:
     return "catalog_ws_" + workspace_id.replace("-", "").lower() if workspace_id else "catalog_default"
+
+
+def migrate_shared_catalog(url: str) -> list[str]:
+    """Create or update the shared catalog (schema `catalog`) in ShipCube's database.
+
+    Run as the migration role after the API's own migrations (the policies use app_workspace()),
+    e.g. from `shipcube_api.admin migrate`. Idempotent; checksummed; advisory-locked."""
+    db = Db(url, shared=True)
+    try:
+        return db.migrate_schema()
+    finally:
+        db.close()

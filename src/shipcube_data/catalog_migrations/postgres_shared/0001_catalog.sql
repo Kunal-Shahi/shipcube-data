@@ -283,3 +283,25 @@ ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log FORCE ROW LEVEL SECURITY;
 CREATE POLICY audit_log_workspace ON audit_log
     USING (workspace_id = app_workspace()) WITH CHECK (workspace_id = app_workspace());
+
+-- The API's owner_defaults.sql only covers schema public. Give ShipCube's service roles the same access
+-- to `catalog`, now and for tables later migrations add. Guarded, so other databases (tests, standalone)
+-- without these roles skip it.
+DO $$
+DECLARE r text;
+BEGIN
+  FOREACH r IN ARRAY ARRAY['shipcube_app', 'shipcube_worker'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+      EXECUTE format('GRANT USAGE ON SCHEMA catalog TO %I', r);
+      EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA catalog TO %I', r);
+      EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA catalog TO %I', r);
+      EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA catalog GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', r);
+      EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA catalog GRANT USAGE, SELECT ON SEQUENCES TO %I', r);
+    END IF;
+  END LOOP;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'shipcube_readonly') THEN
+    GRANT USAGE ON SCHEMA catalog TO shipcube_readonly;
+    GRANT SELECT ON ALL TABLES IN SCHEMA catalog TO shipcube_readonly;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA catalog GRANT SELECT ON TABLES TO shipcube_readonly;
+  END IF;
+END $$;
