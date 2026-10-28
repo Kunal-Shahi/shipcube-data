@@ -129,3 +129,42 @@ def test_concurrent_appliers_in_one_workspace_serialise(shared_db, two):
     [t.start() for t in threads]
     [t.join(timeout=60) for t in threads]
     assert sorted(map(str, results.values())) == ["6", "conflict"]
+
+
+def test_migration_role_without_create_on_the_database(tmp_path):
+    """Like Cloud SQL: the migrator logs in, acts as a NOLOGIN owner role, and has no CREATE on the
+    database. bootstrap.sql provisions schema `catalog` once; catalog-migrate then only creates tables."""
+    from shipcube_data.db import migrate_shared_catalog
+
+    run = uuid.uuid4().hex[:8]
+    dbname, owner, migrator = f"scdata_boot_{run}", f"scdata_owner_{run}", f"scdata_migrator_{run}"
+    base = PG_URL.rsplit("/", 1)[0]
+    with psycopg.connect(PG_URL, autocommit=True) as c:
+        c.execute(f"CREATE DATABASE {dbname}")
+        c.execute(f"CREATE ROLE {owner} NOLOGIN")
+        c.execute(f"CREATE ROLE {migrator} LOGIN")
+        c.execute(f"GRANT {owner} TO {migrator}")
+        c.execute(f"ALTER ROLE {migrator} SET role = '{owner}'")
+    admin_url, migrator_url = f"{base}/{dbname}", f"{base.rsplit('@', 1)[0].rsplit('//', 1)[0]}//{migrator}@{base.rsplit('@', 1)[1]}/{dbname}"
+    try:
+        with psycopg.connect(admin_url, autocommit=True) as c:  # bootstrap.sql's part, as the administrator
+            c.execute("REVOKE CREATE ON DATABASE " + dbname + " FROM PUBLIC")
+            c.execute(f"GRANT USAGE, CREATE ON SCHEMA public TO {owner}")
+            c.execute("CREATE FUNCTION app_workspace() RETURNS uuid LANGUAGE sql STABLE AS "
+                      "$$ SELECT nullif(current_setting('app.workspace_id', true), '')::uuid $$")
+        with pytest.raises(ModelError) as e:  # without the schema provisioned: a clear error, not a crash
+            migrate_shared_catalog(migrator_url)
+        assert e.value.code == "catalog_not_migrated" and "bootstrap.sql" in e.value.hint
+        with psycopg.connect(admin_url, autocommit=True) as c:
+            c.execute("CREATE SCHEMA catalog")
+            c.execute(f"GRANT USAGE, CREATE ON SCHEMA catalog TO {owner}")
+        assert migrate_shared_catalog(migrator_url) == ["0001_catalog.sql"]
+        assert migrate_shared_catalog(migrator_url) == []  # idempotent
+        with psycopg.connect(admin_url) as c:
+            owners = {r[0] for r in c.execute("SELECT tableowner FROM pg_tables WHERE schemaname = 'catalog'")}
+        assert owners == {owner}
+    finally:
+        with psycopg.connect(PG_URL, autocommit=True) as c:
+            c.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
+            c.execute(f"DROP ROLE IF EXISTS {migrator}")
+            c.execute(f"DROP ROLE IF EXISTS {owner}")

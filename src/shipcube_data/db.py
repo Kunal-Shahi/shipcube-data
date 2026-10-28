@@ -89,9 +89,19 @@ class Db:
             if not _SCHEMA_RE.match(self.schema):
                 raise ModelError(f"invalid catalog schema name {self.schema!r}")
             self.conn = psycopg.connect(url, autocommit=True, connect_timeout=10)
-            if create_schema:
-                self.conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
-            elif not self.conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.schema,)).fetchone():
+            # Check first: CREATE SCHEMA IF NOT EXISTS still needs CREATE on the database, which the
+            # migration role doesn't have when the schema is provisioned for it (ShipCube's bootstrap.sql).
+            exists = self.conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.schema,)).fetchone()
+            if not exists and create_schema:
+                try:
+                    self.conn.execute(f'CREATE SCHEMA "{self.schema}"')
+                except psycopg.errors.InsufficientPrivilege:
+                    self.conn.close()
+                    raise ModelError(f"cannot create schema {self.schema}: this role has no CREATE on the database",
+                                     "catalog_not_migrated",
+                                     f"create it once as an administrator, e.g. ShipCube's bootstrap.sql: "
+                                     f"CREATE SCHEMA {self.schema}; GRANT USAGE, CREATE ON SCHEMA {self.schema} TO <migration role>") from None
+            elif not exists:
                 self.conn.close()
                 raise ModelError(f"no catalog for this workspace (schema {self.schema} does not exist)", "catalog_not_migrated")
             if shared:
