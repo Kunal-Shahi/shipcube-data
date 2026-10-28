@@ -142,11 +142,12 @@ def test_migration_role_without_create_on_the_database(tmp_path):
     with psycopg.connect(PG_URL, autocommit=True) as c:
         c.execute(f"CREATE DATABASE {dbname}")
         c.execute(f"CREATE ROLE {owner} NOLOGIN")
-        c.execute(f"CREATE ROLE {migrator} LOGIN")
+        c.execute(f"CREATE ROLE {migrator} LOGIN PASSWORD '{run}'")  # CI's Postgres requires a password
         c.execute(f"GRANT {owner} TO {migrator}")
         c.execute(f"ALTER ROLE {migrator} SET role = '{owner}'")
         c.execute("DO $$ BEGIN CREATE ROLE shipcube_app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$")
-    admin_url, migrator_url = f"{base}/{dbname}", f"{base.rsplit('@', 1)[0].rsplit('//', 1)[0]}//{migrator}@{base.rsplit('@', 1)[1]}/{dbname}"
+    admin_url = f"{base}/{dbname}"
+    migrator_url = f"{base.split('//', 1)[0]}//{migrator}:{run}@{base.rsplit('@', 1)[1]}/{dbname}"
     try:
         with psycopg.connect(admin_url, autocommit=True) as c:  # bootstrap.sql's part, as the administrator
             c.execute("REVOKE CREATE ON DATABASE " + dbname + " FROM PUBLIC")
