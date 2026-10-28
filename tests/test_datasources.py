@@ -142,3 +142,22 @@ def test_duckdb_datasource_in_dev_mode_is_sealed(tmp_path, runner, monkeypatch):
     assert layer.query({"measures": ["orders.count"]}, SecurityContext(tenant="acme"))["rows"][0]["orders__count"] == 50
     with pytest.raises(ModelError, match="file system operations are disabled|Permission"):
         layer.execute("SELECT * FROM read_text('/etc/hosts')", layer.limits, "q_x")
+
+
+def test_warehouse_connects_lazily(tmp_path, monkeypatch):
+    """Opening a workspace's data layer never needs the warehouse; the first query does."""
+    monkeypatch.setenv("SHIPCUBE_DATA_ALLOWED_DB_HOSTS", "warehouse.internal")
+    cat = Catalog(tmp_path / "c.db", workspace_id=str(WS))
+    register_datasource(cat, Datasource(name="primary", kind="postgres", secret_ref=SecretRef(**ref()),
+                                        options={"host": "warehouse.internal"}), "user:x")
+    calls = []
+
+    def resolve(r):
+        calls.append(r)
+        raise ModelError("secret unavailable", "no_datasource")
+
+    layer = DataLayer.from_catalog(cat, resolve)
+    assert layer.catalog.head() == 0 and calls == []  # opened without touching the secret or warehouse
+    with pytest.raises(ModelError, match="secret unavailable"):
+        layer.execute("SELECT 1", layer.limits, "q_1")
+    assert len(calls) == 1

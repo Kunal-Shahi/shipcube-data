@@ -102,10 +102,20 @@ class DataLayer:
 
     @classmethod
     def from_catalog(cls, catalog: Catalog, resolve_secret=None, connectors=None, datasource: str = "primary", **kwargs) -> "DataLayer":
-        """Build a DataLayer that queries the catalog's registered datasource (see datasources.py)."""
+        """Build a DataLayer that queries the catalog's registered datasource (see datasources.py).
+
+        The warehouse is connected on the first query, not here: browsing the model, reviewing
+        migrations or replacing a broken warehouse must not depend on the current one being reachable."""
         from .datasources import open_executor
 
-        return cls(catalog, open_executor(catalog, resolve_secret, datasource, connectors), **kwargs)
+        state: dict[str, Executor] = {}
+
+        def lazy(sql: str, limits: QueryLimits, query_id: str):
+            if "ex" not in state:
+                state["ex"] = open_executor(catalog, resolve_secret, datasource, connectors)
+            return state["ex"](sql, limits, query_id)
+
+        return cls(catalog, lazy, **kwargs)
 
     @property
     def dialect(self) -> str:
