@@ -220,6 +220,9 @@ Runs a typed L0/L1 query, or compiles it without running it.
 | `cannot_draft` | `could not draft a migration from that request` | A sentence the rules understand |
 | `unknown_tool` | `no tool named data_apply_migration` (agents cannot apply) | |
 | `no_datasource` | `no datasource 'primary'; connect a warehouse in the console` | |
+| `tenant_not_provisioned` | `no data is provisioned for tenant 'ws_…' in this workspace (…)` | An admin maps your domain or email to a provisioned tenant, or loads data for it |
+| `catalog_not_migrated` | `no catalog for this workspace` | The workspace has no data layer yet |
+| `internal_error` | `the data layer hit an unexpected RuntimeError` | `logged as err_…`; the details are only in the logs |
 | `forbidden` | Missing scope, not a member, wrong workspace, missing `$ctx` value, no schema binding | |
 
 ## `data_search_values`

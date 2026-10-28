@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("seed", "smoke"):
         s = sub.add_parser(name, help="local stack: seed the demo warehouse and catalog / run the tool smoke test")
         s.add_argument("--force", action="store_true", help="seed: rebuild the DuckDB file even if it exists")
+        s.add_argument("--mcp", action="store_true", help="smoke: go through a running MCP server (SHIPCUBE_MCP_URL, SHIPCUBE_PAT)")
     for name in ("status", "dry-run", "apply", "rollback", "query", "sql", "demo", "catalog-migrate"):
         s = sub.add_parser(name)
         s.add_argument("--catalog", default=os.environ.get("SHIPCUBE_DATA_CATALOG_URL", "catalog.db"))
@@ -65,6 +66,13 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd in {"seed", "smoke"}:
             from . import local
 
+            if a.cmd == "smoke" and a.mcp:
+                from . import mcp_smoke
+
+                results = mcp_smoke.run()
+                failed = [n for n, good, _ in results if not good]
+                print(f"mcp smoke: {len(results) - len(failed)}/{len(results)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
+                return 1 if failed or len(results) < 7 else 0
             settings = local.Settings.from_env()
             if a.cmd == "seed":
                 _print(local.seed(settings, force=a.force))

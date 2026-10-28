@@ -210,3 +210,23 @@ def test_old_data_write_scope_still_proposes(tools):
     with pytest.raises(ToolError, match="data:migrate"):
         tools.call("data_propose_migration", {"description": "x y", "ops": [{"op": "set_meta", "target": "orders", "description": "x"}]},
                    agent(scopes=["data:read"]))
+
+
+def test_unprovisioned_tenant_is_a_typed_error(tools):
+    # A caller whose domain maps to no demo tenant falls back to the workspace tenant, whose schema doesn't exist.
+    for name, args in [("data_query", {"query": {"measures": ["orders.count"]}}),
+                       ("data_search_values", {"dimension": "customers.city", "text": "a"})]:
+        with pytest.raises(ToolError) as e:
+            tools.call(name, args, agent(email="someone@unmapped.test"))
+        assert e.value.code == "tenant_not_provisioned", e.value.to_dict()
+        assert "data attribute `tenant`" in e.value.hint
+
+
+def test_unexpected_errors_become_internal_error(tools, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("driver exploded with secret-ish detail")
+
+    monkeypatch.setattr(tools, "layer_for", boom)
+    with pytest.raises(ToolError) as e:
+        tools.call("data_list_cubes", {}, agent())
+    assert e.value.code == "internal_error" and "secret-ish" not in e.value.message and e.value.hint.startswith("logged as err_")

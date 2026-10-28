@@ -5,7 +5,8 @@
 #   the warehouse and maps demo Google domains to tenants. Idempotent; runs on every `up`.
 # - `mcp` gets the same environment and mounts the five data_ tools with
 #   `shipcube_data.local.tools_from_env()`.
-# - `make smoke` can run: docker compose run --rm data-seed shipcube-data smoke
+# - `make smoke` can run: docker compose run --rm data-seed shipcube-data smoke            (in-process)
+#   and, through the MCP server:  docker compose run --rm -e SHIPCUBE_MCP_URL=http://mcp:8080/mcp -e SHIPCUBE_PAT data-seed shipcube-data smoke --mcp
 #
 # The image is any image with shipcube-data installed. The MCP image already has it (the `data` extra).
 
@@ -17,7 +18,7 @@ x-shipcube-data-env: &shipcube-data-env
   SHIPCUBE_DATA_DUCKDB_PATH: /data/olist.duckdb
   SHIPCUBE_DATA_WAREHOUSE_URL: postgresql://postgres:postgres@postgres:5432/warehouse?sslmode=disable
   SHIPCUBE_DATA_ALLOWED_DB_HOSTS: postgres                  # the stack's own Postgres is private; allow it explicitly
-  SHIPCUBE_DATA_DEMO_TENANTS: ${SHIPCUBE_DATA_DEMO_TENANTS:-example.com=acme,globex.test=globex}
+  SHIPCUBE_DATA_DEMO_TENANTS: ${SHIPCUBE_DATA_DEMO_TENANTS:-shipcube.local=acme,example.com=acme,globex.test=globex}
   SHIPCUBE_DATA_QUERY_TIMEOUT_S: "30"
   SHIPCUBE_DATA_MAX_ROWS: "10000"
   # META_API_KEY: set it to let data_propose_migration draft with Muse Spark; rules otherwise

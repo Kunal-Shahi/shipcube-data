@@ -30,6 +30,14 @@ class WarehouseError(ModelError):
     pass
 
 
+_MISSING = ("does not exist", "was not found", "not found: dataset", "not found: table", "undefined table", "undefined schema")
+
+
+def _missing_relation(msg: str) -> bool:
+    m = msg.lower()
+    return any(s in m for s in _MISSING) and any(w in m for w in ("schema", "table", "dataset", "relation"))
+
+
 @dataclass(frozen=True)
 class QueryLimits:
     timeout_s: float = 30.0
@@ -98,7 +106,7 @@ class DuckDBWarehouse:
             except duckdb.InterruptException:
                 raise WarehouseError(f"query exceeded {limits.timeout_s}s", "query_timeout") from None
             except duckdb.Error as e:
-                raise WarehouseError(f"duckdb: {e}", "warehouse_error") from None
+                raise WarehouseError(f"duckdb: {e}", "missing_relation" if _missing_relation(str(e)) else "warehouse_error") from None
             finally:
                 timer.cancel()
         return ExecResult([d[0] for d in cur.description], rows[: limits.max_rows], len(rows) > limits.max_rows)
@@ -165,6 +173,8 @@ class PostgresWarehouse:
                     if attempt:
                         raise WarehouseError(f"postgres unavailable: {type(e).__name__}", "warehouse_unavailable") from None
                     log_event("warehouse.reconnect", query_id=query_id, error=type(e).__name__)
+                except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName) as e:
+                    raise WarehouseError(f"postgres: {e.diag.message_primary}", "missing_relation") from None
                 except psycopg.Error as e:
                     raise WarehouseError(f"postgres: {e.diag.message_primary or type(e).__name__}", "warehouse_error") from None
         raise AssertionError("unreachable")
@@ -231,6 +241,8 @@ class BigQueryWarehouse:
             raise
         except (gexc.ServiceUnavailable, gexc.InternalServerError, gexc.TooManyRequests) as e:
             raise WarehouseError(f"bigquery unavailable: {type(e).__name__}", "warehouse_unavailable") from None
+        except gexc.NotFound as e:
+            raise WarehouseError(f"bigquery: {getattr(e, 'message', e)}", "missing_relation") from None
         except gexc.GoogleAPICallError as e:
             msg = getattr(e, "message", str(e))
             code = "cost_limit" if "bytesBilledLimitExceeded" in str(e) else "warehouse_error"

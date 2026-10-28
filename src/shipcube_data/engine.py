@@ -204,7 +204,16 @@ class DataLayer:
             stats: dict[str, Any] = {}
             truncated = False
             if cached is None:
-                res = self.execute(compiled.sql, self.limits, query_id)
+                try:
+                    res = self.execute(compiled.sql, self.limits, query_id)
+                except ModelError as e:
+                    if e.code != "missing_relation":
+                        raise
+                    raise ModelError(
+                        f"no data is provisioned for tenant {ctx.tenant!r} in this workspace ({e})", "tenant_not_provisioned",
+                        "an admin maps your Google domain or email to a provisioned tenant (data attribute `tenant`), "
+                        "or loads data into that tenant's schema",
+                    ) from None
                 rows, truncated, stats = [dict(zip(res.columns, r)) for r in res.rows], res.truncated, res.stats
                 if use_cache and not truncated:
                     self.cache.put(key, rows)

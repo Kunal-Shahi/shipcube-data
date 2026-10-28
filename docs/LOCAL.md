@@ -87,6 +87,28 @@ The smoke runs the tools exactly as the MCP server calls them. It acts as an age
 
 It exits non-zero if any step fails. The same sequence runs in CI and in `tests/test_local.py` (SQLite + DuckDB always; Postgres + Postgres when `SHIPCUBE_TEST_PG_URL` is set).
 
+### Through the MCP server
+
+`shipcube-data smoke --mcp` runs the same steps end to end through a running MCP server, with a PAT. That covers auth, mounting, caller resolution and error mapping. It needs only the standard library: a minimal Streamable HTTP client that handles JSON and SSE responses. For the agent-cannot-apply step, it checks that no apply tool is listed or callable, and that the proposed measure is not in `data_describe_cube`.
+
+From the host (for `deploy/local/smoke/data_smoke.sh`, which receives `SHIPCUBE_MCP_URL` and `SHIPCUBE_PAT`):
+
+```bash
+uvx --from "shipcube-data @ git+https://github.com/Kunal-Shahi/shipcube-data@<commit>" shipcube-data smoke --mcp
+```
+
+Or inside the compose network:
+
+```bash
+docker compose run --rm -e SHIPCUBE_MCP_URL=http://mcp:8080/mcp -e SHIPCUBE_PAT data-seed shipcube-data smoke --mcp
+```
+
+`tests/test_mcp_smoke.py` runs it against a real MCP SDK 2.x server (`MCPServer`, the same class ShipCube's server uses) serving these tools.
+
+### Unprovisioned tenants
+
+A caller whose Google domain or email isn't mapped to a demo tenant falls back to the workspace's own tenant, which has no demo data. `data_query` and `data_search_values` then return `tenant_not_provisioned`, with a hint. Map the domain in `SHIPCUBE_DATA_DEMO_TENANTS`, for example `shipcube.local=acme` for the stack's seeded user. Any unexpected exception becomes `internal_error`, with an incident id in the hint and the details in the logs; MCP clients never see raw driver errors.
+
 ## 5. Without Docker
 
 ```bash

@@ -31,6 +31,7 @@ from .drafting import DraftProvider, MuseDrafter
 from .engine import DataLayer
 from .identity import Caller, security_context
 from .model import ModelError
+from .obs import log_event, new_query_id
 from .catalog import _loads
 from .ops import OP_ADAPTER, Migration
 from .query import Query
@@ -169,6 +170,14 @@ class DataTools:
             raise ToolError("invalid_arguments", f"{where}: {first['msg']}", f"{len(e.errors())} error(s) in total") from None
         except ModelError as e:
             raise ToolError(e.code, str(e), e.hint) from None
+        except ToolError:
+            raise
+        except Exception as e:  # never hand a raw driver exception to an MCP client
+            incident = new_query_id().replace("q_", "err_")
+            log_event("tool.internal_error", level=40, tool=tool.name, incident=incident, error=type(e).__name__,
+                      detail=str(e)[:500], workspace_id=str(caller.workspace_id))
+            raise ToolError("internal_error", f"the data layer hit an unexpected {type(e).__name__}",
+                            f"logged as {incident}; tell the workspace admin") from None
 
     def _ctx(self, caller: Caller):
         layer = self.layer_for(caller.workspace_id)

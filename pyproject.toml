@@ -15,7 +15,7 @@ duckdb = ["duckdb>=1.0"]
 postgres = ["psycopg[binary]>=3.2"]
 bigquery = ["google-cloud-bigquery>=3.25"]
 all = ["duckdb>=1.0", "psycopg[binary]>=3.2", "google-cloud-bigquery>=3.25"]
-dev = ["duckdb>=1.0", "psycopg[binary]>=3.2", "google-cloud-bigquery>=3.25", "pytest>=8.0"]
+dev = ["duckdb>=1.0", "psycopg[binary]>=3.2", "google-cloud-bigquery>=3.25", "pytest>=8.0", "mcp>=2.0", "uvicorn>=0.30"]
 
 [project.scripts]
 shipcube-data = "shipcube_data.cli:main"
