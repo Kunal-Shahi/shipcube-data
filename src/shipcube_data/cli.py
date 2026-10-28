@@ -8,6 +8,9 @@
   shipcube-data query    --catalog catalog.db --warehouse demo.duckdb --tenant acme '{"measures": ["orders.count"]}'
   shipcube-data sql      --catalog catalog.db --tenant acme --dialect bigquery '{...}'
   shipcube-data catalog-migrate --catalog postgresql://... --workspace <uuid>
+  shipcube-data catalog-migrate --catalog postgresql://.../shipcube --shared   # production: as the migration role
+  shipcube-data seed  [--force]   # local stack, configured from env (see shipcube_data/local.py)
+  shipcube-data smoke             # list cubes → describe → query → search → propose → agent cannot apply
 
 `--catalog` is a SQLite path or a postgresql:// URL (default: $SHIPCUBE_DATA_CATALOG_URL, else catalog.db).
 `--workspace` selects the workspace's catalog schema on Postgres (default: $SHIPCUBE_DATA_WORKSPACE_ID).
@@ -40,6 +43,10 @@ def _print(obj: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="shipcube-data")
     sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("seed", "smoke"):
+        s = sub.add_parser(name, help="local stack: seed the demo warehouse and catalog / run the tool smoke test")
+        s.add_argument("--force", action="store_true", help="seed: rebuild the DuckDB file even if it exists")
+        s.add_argument("--mcp", action="store_true", help="smoke: go through a running MCP server (SHIPCUBE_MCP_URL, SHIPCUBE_PAT)")
     for name in ("status", "dry-run", "apply", "rollback", "query", "sql", "demo", "catalog-migrate"):
         s = sub.add_parser(name)
         s.add_argument("--catalog", default=os.environ.get("SHIPCUBE_DATA_CATALOG_URL", "catalog.db"))
@@ -51,12 +58,32 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--attr", action="append", default=[], help="security context attribute key=value")
         s.add_argument("--dialect", default=None)
         s.add_argument("--dry-run", action="store_true")
+        s.add_argument("--shared", action="store_true", default=os.environ.get("SHIPCUBE_DATA_CATALOG_LAYOUT") == "shared",
+                       help="the shared catalog in ShipCube's database (schema catalog, RLS); $SHIPCUBE_DATA_CATALOG_LAYOUT=shared")
         s.add_argument("--actor", default=os.environ.get("USER"))
         s.add_argument("arg", nargs="?")
     a = p.parse_args(argv)
     configure_logging(os.environ.get("SHIPCUBE_DATA_LOG_LEVEL", "WARNING"), stream=sys.stderr)
 
     try:
+        if a.cmd in {"seed", "smoke"}:
+            from . import local
+
+            if a.cmd == "smoke" and a.mcp:
+                from . import mcp_smoke
+
+                results = mcp_smoke.run()
+                failed = [n for n, good, _ in results if not good]
+                print(f"mcp smoke: {len(results) - len(failed)}/{len(results)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
+                return 1 if failed or len(results) < 7 else 0
+            settings = local.Settings.from_env()
+            if a.cmd == "seed":
+                _print(local.seed(settings, force=a.force))
+                return 0
+            steps = local.smoke(settings)
+            failed = [st.name for st in steps if not st.ok]
+            print(f"smoke: {len(steps) - len(failed)}/{len(steps)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
+            return 1 if failed else 0
         if a.cmd == "demo":
             import duckdb
 
@@ -70,11 +97,11 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "catalog-migrate":
             from .db import Db, workspace_schema
 
-            db = Db(a.catalog, schema=workspace_schema(a.workspace))
+            db = Db(a.catalog, shared=True) if a.shared else Db(a.catalog, schema=workspace_schema(a.workspace))
             applied = db.migrate_schema()
             print(f"catalog schema {db.schema or a.catalog}: applied {applied or 'nothing (up to date)'}")
             return 0
-        cat = Catalog(a.catalog, workspace_id=a.workspace)
+        cat = Catalog(a.catalog, workspace_id=a.workspace, shared=a.shared, migrate=not a.shared)
         runner = Runner(cat)
         if a.cmd == "status":
             for row in runner.status(load_dir(a.dir)):

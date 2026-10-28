@@ -15,6 +15,7 @@ import hashlib
 import json
 from typing import Annotated, Any, Literal, Optional, Union
 
+from sqlglot import exp
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from .model import (
@@ -193,9 +194,15 @@ class CreateCube(_Op):
         if self.name in model.cubes:
             raise ModelError(f"cube {self.name!r} already exists")
         if self.sql:
-            from .sqlutil import parse_query
+            from .sqlutil import forbidden_function, parse_query
 
-            parse_query(self.sql, dialect)
+            tree = parse_query(self.sql, dialect)
+            if not isinstance(tree, exp.Query):
+                raise ModelError("a cube's sql must be a single SELECT")
+            for node in tree.walk():
+                bad = forbidden_function(node)
+                if bad:
+                    raise ModelError(f"cube SQL may not call {bad}", "invalid_sql")
         cube = Cube(name=self.name, table=self.table, sql=self.sql, title=self.title, description=self.description)
         cube.measures["count"] = Measure(name="count", agg="count")
         model.cubes[self.name] = cube
@@ -686,6 +693,17 @@ class Migration(BaseModel):
     def kind(self) -> Kind:
         kinds = {op.classify() for op in self.ops}
         return "breaking" if "breaking" in kinds else "change" if "change" in kinds else "additive"
+
+    def widens_exposure(self) -> list[str]:
+        """Ops that can make data visible that was not visible before (new members, cubes, joins,
+        re-routing, removed restrictions). Approving these needs an admin (red-team issue #6)."""
+        return [op.op for op in self.ops if op.op in WIDENS_EXPOSURE]
+
+
+WIDENS_EXPOSURE = {
+    "create_cube", "add_measure", "add_dimension", "add_join", "change_sql", "bind_schema",
+    "revoke_member", "drop_row_policy",
+}
 
 
 def apply_ops(model: Model, ops: list[Op], dialect: str) -> tuple[Model, set[str]]:

@@ -28,6 +28,17 @@ jobs:
       - run: uv venv -p 3.12 .venv
       - run: uv pip install -p .venv -e '.[dev]'
       - run: .venv/bin/pytest -q
+      - name: Local stack path (seed + smoke), DuckDB and Postgres warehouses
+        env:
+          SHIPCUBE_DEV_MODE: "1"
+          SHIPCUBE_DATA_CATALOG_URL: postgresql://postgres:postgres@localhost:5432/shipcube_data
+          SHIPCUBE_DATA_ALLOWED_DB_HOSTS: localhost
+        run: |
+          SHIPCUBE_DATA_WORKSPACE=0e364bd8-4622-42d1-839c-35aae720b52b SHIPCUBE_DATA_DUCKDB_PATH=/tmp/olist.duckdb \
+            sh -c '.venv/bin/shipcube-data seed && .venv/bin/shipcube-data smoke'
+          SHIPCUBE_DATA_WORKSPACE=11111111-2222-4333-8444-555555555555 SHIPCUBE_DATA_WAREHOUSE=postgres \
+            SHIPCUBE_DATA_WAREHOUSE_URL='postgresql://postgres:postgres@localhost:5432/warehouse?sslmode=disable' \
+            sh -c '.venv/bin/shipcube-data seed && .venv/bin/shipcube-data smoke'
       - name: Build the wheel
         run: uv build --wheel
 

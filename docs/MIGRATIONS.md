@@ -449,7 +449,7 @@ This example starts again from the demo model at v5, independent of 10.2.
 ```
 
 - New queries get the net revenue.
-- A dashboard that must not move during the quarter sends `"model_version": 5` and keeps the old definition.
+- A dashboard that must not move during the quarter sends `"model_version": 5` and keeps the old definition. The pin only affects definitions: who may see what is always decided by the current version.
 - The catalog row history for `order_items.revenue` is `price [v2, v6)`, then `price - freight_value [v6, …)`. `test_change_sql_is_versioned_and_pinnable` asserts exactly this.
 
 ### 10.4 An agent proposal

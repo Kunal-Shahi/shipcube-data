@@ -30,6 +30,14 @@ class WarehouseError(ModelError):
     pass
 
 
+_MISSING = ("does not exist", "was not found", "not found: dataset", "not found: table", "undefined table", "undefined schema")
+
+
+def _missing_relation(msg: str) -> bool:
+    m = msg.lower()
+    return any(s in m for s in _MISSING) and any(w in m for w in ("schema", "table", "dataset", "relation"))
+
+
 @dataclass(frozen=True)
 class QueryLimits:
     timeout_s: float = 30.0
@@ -75,9 +83,16 @@ def _retry(fn, attempts: int = 3, base_delay: float = 0.5, retry_on: tuple = (),
 # ---------------------------------------------------------------- DuckDB (local dev and tests)
 
 class DuckDBWarehouse:
+    """DuckDB for local development and tests. Never a production datasource kind.
+
+    The connection is sealed on construction: no file, HTTP or extension access, and the
+    configuration is locked so a query cannot turn it back on. (Red-team issue #5.)
+    """
+
     def __init__(self, con):
         self.con = con
         self._lock = threading.Lock()  # one DuckDB connection runs one query at a time
+        seal_duckdb(con)
 
     def __call__(self, sql: str, limits: QueryLimits, query_id: str) -> ExecResult:
         import duckdb
@@ -91,10 +106,20 @@ class DuckDBWarehouse:
             except duckdb.InterruptException:
                 raise WarehouseError(f"query exceeded {limits.timeout_s}s", "query_timeout") from None
             except duckdb.Error as e:
-                raise WarehouseError(f"duckdb: {e}", "warehouse_error") from None
+                raise WarehouseError(f"duckdb: {e}", "missing_relation" if _missing_relation(str(e)) else "warehouse_error") from None
             finally:
                 timer.cancel()
         return ExecResult([d[0] for d in cur.description], rows[: limits.max_rows], len(rows) > limits.max_rows)
+
+
+def seal_duckdb(con) -> None:
+    for stmt in ("SET enable_external_access = false", "SET autoinstall_known_extensions = false",
+                 "SET autoload_known_extensions = false", "SET lock_configuration = true"):
+        try:
+            con.execute(stmt)
+        except Exception as e:  # already locked by an earlier seal: fine; anything else is not
+            if "lock_configuration" not in str(e) and "locked" not in str(e).lower():
+                raise
 
 
 # ---------------------------------------------------------------- Postgres (Cloud SQL)
@@ -148,6 +173,8 @@ class PostgresWarehouse:
                     if attempt:
                         raise WarehouseError(f"postgres unavailable: {type(e).__name__}", "warehouse_unavailable") from None
                     log_event("warehouse.reconnect", query_id=query_id, error=type(e).__name__)
+                except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName) as e:
+                    raise WarehouseError(f"postgres: {e.diag.message_primary}", "missing_relation") from None
                 except psycopg.Error as e:
                     raise WarehouseError(f"postgres: {e.diag.message_primary or type(e).__name__}", "warehouse_error") from None
         raise AssertionError("unreachable")
@@ -156,20 +183,31 @@ class PostgresWarehouse:
 # ---------------------------------------------------------------- BigQuery
 
 class BigQueryWarehouse:
-    """BigQuery through google-cloud-bigquery. Credentials: a service-account JSON from Secret
-    Manager, or (preferred on Cloud Run) the runtime service account via ADC."""
+    """BigQuery through google-cloud-bigquery. Credentials: a service-account key from Secret
+    Manager, or impersonation of a service account in the customer's project (ShipCube's runtime
+    identity only needs `iam.serviceAccountTokenCreator` on it). `client` is for tests."""
 
-    def __init__(self, project: str, location: Optional[str] = None, credentials_json: Optional[str] = None, client=None):
+    def __init__(self, project: str, location: Optional[str] = None, credentials_json: Optional[str] = None,
+                 impersonate: Optional[str] = None, client=None):
         if client is None:
             from google.cloud import bigquery
 
-            creds = None
+            scopes = ["https://www.googleapis.com/auth/bigquery"]
             if credentials_json:
                 import json
 
                 from google.oauth2 import service_account
 
-                creds = service_account.Credentials.from_service_account_info(json.loads(credentials_json))
+                creds = service_account.Credentials.from_service_account_info(json.loads(credentials_json), scopes=scopes)
+            elif impersonate:
+                import google.auth
+                from google.auth import impersonated_credentials
+
+                source, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+                creds = impersonated_credentials.Credentials(source_credentials=source, target_principal=impersonate,
+                                                             target_scopes=scopes, lifetime=900)
+            else:
+                raise WarehouseError("BigQuery needs a service-account key or a service account to impersonate", "forbidden")
             client = bigquery.Client(project=project, credentials=creds, location=location)
         self.client, self.location = client, location
 
@@ -203,6 +241,8 @@ class BigQueryWarehouse:
             raise
         except (gexc.ServiceUnavailable, gexc.InternalServerError, gexc.TooManyRequests) as e:
             raise WarehouseError(f"bigquery unavailable: {type(e).__name__}", "warehouse_unavailable") from None
+        except gexc.NotFound as e:
+            raise WarehouseError(f"bigquery: {getattr(e, 'message', e)}", "missing_relation") from None
         except gexc.GoogleAPICallError as e:
             msg = getattr(e, "message", str(e))
             code = "cost_limit" if "bytesBilledLimitExceeded" in str(e) else "warehouse_error"

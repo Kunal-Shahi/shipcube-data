@@ -38,7 +38,7 @@ No level has company-specific metric kinds. Funnels, cohorts and retention are b
 | `segments` | Named filters from the model (`cube.segment`). |
 | `order` | Member paths, output column names, or calc names. Default: time ascending if grouped by time, else the first measure descending. |
 | `limit` / `offset` | `limit` defaults to 10,000, which is also the cap. The result warns when the default applies. |
-| `model_version` | Compile against an older model version (see [MIGRATIONS.md](MIGRATIONS.md), "Changing a definition, with a pinned reader"). |
+| `model_version` | Use member definitions (SQL, aggregation, filter) from an older model version (see [MIGRATIONS.md](MIGRATIONS.md), "Changing a definition, with a pinned reader"). Access rules (grants, row policies, bindings), joins and partitions always come from the current version, and members dropped since are gone. |
 
 ### Filter operators
 
