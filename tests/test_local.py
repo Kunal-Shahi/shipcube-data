@@ -68,6 +68,9 @@ def test_tools_refuse_unseeded_workspaces(dev, tmp_path):
 
 
 def test_forget_workspace_drops_only_that_workspaces_layers(dev, tmp_path):
+    from shipcube_data.catalog import Catalog
+
+    Catalog(tmp_path / "c.db").close()  # migrated catalog (SQLite has one; workspaces share it here)
     dev.setenv("SHIPCUBE_DATA_CATALOG_URL", str(tmp_path / "c.db"))
     tools = local.tools_from_env()
     a, b = uuid.uuid4(), uuid.uuid4()
