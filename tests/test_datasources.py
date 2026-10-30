@@ -118,6 +118,18 @@ def test_secret_url_hosts_are_checked_too(monkeypatch):
         postgres_connector(ds, "postgresql://u:p@10.1.2.3/db?sslmode=verify-full")
 
 
+@pytest.mark.parametrize("extra", ["hostaddr=10.1.2.3", "service=prod", "passfile=/etc/passwd", "options=-c%20statement_timeout%3D0",
+                                   "sslrootcert=/etc/ssl/key", "target_session_attrs=any"])
+def test_secret_urls_may_only_set_plain_connection_keys(extra):
+    """A URL secret can't redirect the connection past check_db_host or read the server's files (shipcube-data #8)."""
+    from shipcube_data.datasources import postgres_connector
+
+    ds = Datasource(name="primary", kind="postgres", secret_ref=SecretRef(**ref()), options={})
+    with pytest.raises(ModelError, match="may not set") as e:
+        postgres_connector(ds, f"postgresql://u:p@db.example.com/db?sslmode=verify-full&{extra}")
+    assert e.value.code == "forbidden"
+
+
 def test_local_secrets_only_in_dev_mode(monkeypatch):
     r = SecretRef(id="x", resource_name=f"projects/local/secrets/ws-{WS}-warehouse", version="1")
     with pytest.raises(ModelError, match="SHIPCUBE_DEV_MODE"):

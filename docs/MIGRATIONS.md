@@ -114,7 +114,7 @@ A migration's kind is the most severe kind among its ops. The kind feeds the app
 |---|---|---|---|
 | `add_join` | `cube`, `to`, one of `on` / `key` | `relationship` (default `many_to_one`) | additive |
 | `drop_join` | `cube`, `to` | | breaking |
-| `add_segment` | `name` (`cube.segment`), `sql` | `title`, `description` | additive |
+| `add_segment` | `name` (`cube.segment`), `sql` | `title`, `description` | additive; widens exposure, so an admin approves it |
 
 - A join is declared once and walked both ways. Walking it backwards inverts the relationship, so `many_to_one` becomes `one_to_many`.
 - `key: "customer_id"` is shorthand for `on: "orders.customer_id = customers.customer_id"`.

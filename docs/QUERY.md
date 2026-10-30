@@ -35,7 +35,7 @@ No level has company-specific metric kinds. Funnels, cohorts and retention are b
 | `dimensions` | Group-by columns. Their cubes must be reachable through the model's joins. |
 | `time` | One time dimension. `granularity` (`day`, `month` or `year`) adds a truncated group-by column. `range` is an inclusive `[from, to]`: a date-only `to` covers the whole day. Without a granularity, `time` only filters. |
 | `filters` | A list (AND) of conditions or `{"and": […]}`, `{"or": […]}`, `{"not": …}` trees. A tree is either all dimensions (goes to `WHERE`) or all measures (goes to `HAVING`), never mixed. |
-| `segments` | Named filters from the model (`cube.segment`). |
+| `segments` | Named filters from the model (`cube.segment`). A segment that reads a member hidden from the caller, or that member's column, is refused like the member itself. Segment SQL reads only its own cube's columns by plain name: no qualified columns, stars or whole-row references such as `CAST(orders AS TEXT)`. |
 | `order` | Member paths, output column names, or calc names. Default: time ascending if grouped by time, else the first measure descending. |
 | `limit` / `offset` | `limit` defaults to 10,000, which is also the cap. The result warns when the default applies. |
 | `model_version` | Use member definitions (SQL, aggregation, filter) from an older model version (see [MIGRATIONS.md](MIGRATIONS.md), "Changing a definition, with a pinned reader"). Access rules (grants, row policies, bindings), joins and partitions always come from the current version, and members dropped since are gone. |
@@ -168,7 +168,7 @@ Typical shapes:
 
 1. The input must parse as **exactly one statement**, and that statement must be a query (`SELECT`/`UNION`/`WITH … SELECT`).
 2. It rejects any DDL, DML, `SET`, `COPY`, `ATTACH`, `PRAGMA` or `SELECT … INTO` node anywhere in the tree.
-3. It rejects **table functions** and file or network readers (`read_csv`, `read_parquet`, `glob`, `getenv`, `pg_read_file`, `external_query`, …).
+3. It rejects **table functions** and file or network readers (`read_csv`, `read_parquet`, `glob`, `getenv`, `pg_read_file`, `external_query`, …), functions that run SQL or change settings (`query_to_xml` and the other `*_to_xml`, `dblink*`, `set_config`, `xpath`, sequences), and any function sqlglot doesn't recognise unless it is on the allowlist (`ALLOWED_UNTYPED_FUNCS` in `sqlutil.py`). Model SQL (member, segment and join SQL) follows the same rules.
 4. It rejects three-part names: no other database or catalog.
 5. Unqualified tables are qualified with the tenant's default schema. Qualified tables must be in a schema the tenant is bound to. `information_schema`, `pg_catalog`, `system` and `main` are always refused.
 6. **It refuses outright when any row policy applies to the caller.** Raw SQL cannot have policies injected reliably.
