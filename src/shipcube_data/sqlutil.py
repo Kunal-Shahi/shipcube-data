@@ -102,6 +102,28 @@ def raw_columns(sql: str, dialect: str) -> set[str]:
     return {c.name.lower() for c in parse_expr(sql, dialect).find_all(exp.Column) if ref_name(c) is None}
 
 
+# Relation aliases the compiler itself uses, besides the cube names.
+INTERNAL_ALIASES = {"keys", "base", "raw"}
+
+
+def row_reference(sql: str, dialect: str, relations: set[str]) -> str | None:
+    """A reference in filter SQL that reads a whole row, or another relation's columns: a qualified
+    column (`customers.city`), a star, or a bare name that is a relation alias (`CAST(order_items AS
+    TEXT)` is the whole row in Postgres). Segments may only read their own cube's plain columns."""
+    names = {r.lower() for r in relations} | INTERNAL_ALIASES
+    tree = parse_expr(sql, dialect)
+    if tree.find(exp.Star):
+        return "*"
+    for c in tree.find_all(exp.Column):
+        if ref_name(c) is not None:
+            continue
+        if c.table:
+            return c.sql()
+        if c.name.lower() in names:
+            return c.name
+    return None
+
+
 def ref_name(col: exp.Column) -> str | None:
     """If `col` is a {ref} placeholder, return 'member' or 'cube.member'."""
     if col.table or not col.name.startswith(REF_PREFIX):

@@ -214,6 +214,42 @@ def test_segments_cannot_read_hidden_members(runner, dl, acme):
     assert len(dl.describe_cube("order_items", finance)["segments"]) == 3
 
 
+@pytest.mark.parametrize("sql", [
+    "CAST(order_items AS TEXT) LIKE '%9%'",              # whole row (Postgres): includes freight_value
+    "order_items::text LIKE '%9%'",
+    "(order_items) IS NOT NULL",
+    "CAST(customers AS TEXT) LIKE '%sao%'",              # another cube's alias
+    "customers.city = 'sao paulo'",                     # another cube's column, past the hidden-column check
+    "order_items.freight_value > 30",                    # qualified: refused even for its own cube
+    "CAST(keys AS TEXT) LIKE '%x%'",                     # the compiler's own aliases
+])
+def test_segments_cannot_read_whole_rows_or_other_relations(runner, sql):
+    """Red-team follow-up on #8: a relation name used as a column is the whole row, hidden columns included."""
+    with pytest.raises(ModelError, match="own columns by name"):
+        apply(runner, "0006_row", {"op": "add_segment", "name": "order_items.leak", "sql": sql})
+
+
+@pytest.mark.parametrize("sql", [
+    "row_to_json(order_items)::text LIKE '%9%'",
+    "to_jsonb(order_items) IS NOT NULL",
+    "ROW(order_items.*)::text LIKE '%9%'",
+    "CAST(ROW(price, freight_value) AS TEXT) LIKE '%9%'",
+])
+def test_row_constructor_and_json_variants_are_refused(runner, sql):
+    with pytest.raises(ModelError, match="may not call|own columns by name"):
+        apply(runner, "0006_row", {"op": "add_segment", "name": "order_items.leak", "sql": sql})
+
+
+def test_stored_whole_row_segments_are_not_usable(runner, dl, acme):
+    """A segment stored before add_segment checked this is refused when compiling, for everyone."""
+    apply(runner, "0006_ok", {"op": "add_segment", "name": "order_items.pricey", "sql": "price > 100"})
+    model = runner.catalog.load()
+    model.cubes["order_items"].segments["pricey"].sql = "CAST(order_items AS TEXT) LIKE '%9%'"
+    from shipcube_data.compiler import Compiler
+    assert not Compiler(model, acme).segment_visible(model.cubes["order_items"], "CAST(order_items AS TEXT) LIKE '%9%'")
+    assert Compiler(model, acme).segment_visible(model.cubes["order_items"], "price > 100")
+
+
 def test_add_segment_needs_an_admin_to_approve():
     m = Migration.model_validate({"id": "0001_x", "ops": [{"op": "add_segment", "name": "orders.late", "sql": "order_status = 'late'"}]})
     assert m.kind() == "additive" and m.widens_exposure() == ["add_segment"]

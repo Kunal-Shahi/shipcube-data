@@ -24,7 +24,7 @@ from sqlglot import exp
 from .model import ADDITIVE_AGGS, FANOUT_SAFE_AGGS, IDENT, Cube, Dimension, Measure, Member, Model, ModelError, humanize
 from .partitions import Bounds, prune, timestamp_type, to_date
 from .query import And, Calc, Condition, Filter, Not, Or, Query, filter_members, parse_filter
-from .sqlutil import parse_expr, parse_query, raw_columns, ref_name, refs
+from .sqlutil import parse_expr, parse_query, raw_columns, ref_name, refs, row_reference
 
 DIALECTS = ("duckdb", "postgres", "bigquery", "clickhouse")
 DEFAULT_LIMIT = 10_000
@@ -137,7 +137,10 @@ class Compiler:
 
     def segment_visible(self, cube: Cube, sql: str) -> bool:
         """Segments are filters, so they leak through row counts: a segment is usable only if every
-        member it references is visible and it reads no column a hidden member reads (shipcube-data #8)."""
+        member it references is visible and it reads no column a hidden member reads (shipcube-data #8).
+        Whole-row and other-relation references are refused here too, for segments stored before add_segment checked."""
+        if row_reference(sql, self.src, set(self.model.cubes)):
+            return False
         for ref in refs(sql):
             target = cube.member(ref.rpartition(".")[2])
             if target is None or not self.visible(cube, target):

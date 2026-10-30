@@ -36,7 +36,7 @@ from .model import (
     check_ident,
 )
 from .query import filter_members, parse_filter
-from .sqlutil import has_aggregate, parse_expr, refs
+from .sqlutil import has_aggregate, parse_expr, refs, row_reference
 
 Kind = Literal["additive", "change", "breaking"]
 
@@ -512,6 +512,10 @@ class AddSegment(_Op):
         if name in cube.segments:
             raise ModelError(f"segment {self.name} already exists")
         parse_expr(self.sql, dialect)
+        bad = row_reference(self.sql, dialect, set(model.cubes))
+        if bad:
+            raise ModelError(f"segment SQL may only read {cube_name}'s own columns by name, not {bad!r} "
+                             "(no qualified columns, stars or whole-row references)", "invalid_sql")
         _check_refs(model, cube, self.sql, measures_ok=False)
         cube.segments[name] = Segment(name=name, sql=self.sql, title=self.title, description=self.description)
 
