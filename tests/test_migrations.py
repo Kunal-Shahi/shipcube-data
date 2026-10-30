@@ -118,12 +118,66 @@ def test_rename_keeps_old_name_working(runner, dl, acme):
 
 def test_change_sql_is_versioned_and_pinnable(runner, dl, acme):
     before = dl.query({"measures": ["order_items.revenue"]}, acme)["rows"][0]["order_items__revenue"]
-    runner.apply(mig("0006_net", {"op": "change_sql", "member": "order_items.revenue", "sql": "price - freight_value"}))
+    runner.apply(mig("0006_net", {"op": "change_sql", "member": "order_items.revenue", "sql": "price - freight_value",
+                                  "pin_compatible": True}))
     after = dl.query({"measures": ["order_items.revenue"]}, acme)["rows"][0]["order_items__revenue"]
     pinned = dl.query({"measures": ["order_items.revenue"], "model_version": 5}, acme)["rows"][0]["order_items__revenue"]
     assert after < before and pinned == before
     hist = runner.catalog.history("order_items", "revenue")
     assert [(h["sql"], h["since_version"], h["until_version"]) for h in hist] == [("price", 2, 6), ("price - freight_value", 6, None)]
+
+
+def _cities(dl, ctx, **pin):
+    rows = dl.query({"dimensions": ["customers.city"], "measures": ["customers.count"], "order": [{"member": "customers.city"}],
+                     "limit": 5, **pin}, ctx)
+    return [r["customers__city"] for r in rows["rows"]], rows["warnings"]
+
+
+def test_a_pin_cannot_undo_a_masking_change(runner, dl, acme):
+    """shipcube-data #8: pinning a version from before a masking change_sql must not unmask the member.
+    Fails closed: no flag is needed, an old definition comes back only for `pin_compatible` changes."""
+    plain, _ = _cities(dl, acme)
+    runner.apply(mig("0006_mask", {"op": "change_sql", "member": "customers.city", "sql": "md5(customer_city)"}))
+    masked, _ = _cities(dl, acme)
+    pinned, warnings = _cities(dl, acme, model_version=5)
+    assert masked != plain and pinned == masked
+    assert any("customers.city uses the current definition" in w for w in warnings)
+    assert not any("customers.count" in w for w in warnings)
+    # Renaming the member afterwards doesn't reopen the gap.
+    runner.apply(mig("0007_rename", {"op": "rename_member", "member": "customers.city", "to": "town"}))
+    rows = dl.query({"dimensions": ["customers.city"], "measures": ["customers.count"], "order": [{"member": "customers.town"}],
+                     "limit": 5, "model_version": 5}, acme)["rows"]
+    assert [r["customers__city"] for r in rows] == masked
+
+
+def test_a_pin_compatible_change_sql_still_pins(runner, dl, acme):
+    plain, _ = _cities(dl, acme)
+    runner.apply(mig("0006_upper", {"op": "change_sql", "member": "customers.city", "sql": "upper(customer_city)", "pin_compatible": True}))
+    pinned, warnings = _cities(dl, acme, model_version=5)
+    assert pinned == plain and not any("current definition" in w for w in warnings)
+
+
+def test_a_pin_cannot_bring_back_a_dropped_members_sql(runner, dl, acme):
+    """Dropping a member and adding a masked one under the same name is a masking change too."""
+    runner.apply(mig("0006_drop", {"op": "drop_member", "member": "customers.city"}))
+    runner.apply(mig("0007_readd", {"op": "add_dimension", "name": "customers.city", "type": "string", "sql": "left(customer_city, 1)"}))
+    masked, _ = _cities(dl, acme)
+    pinned, _ = _cities(dl, acme, model_version=5)
+    assert pinned == masked and all(len(c) == 1 for c in masked)
+
+
+def test_a_pin_cannot_bring_back_a_dropped_cubes_members(runner, dl, acme):
+    """drop_cube then create_cube under the same name: every member is new, whatever its name."""
+    runner.apply(mig("0006_dropcube", {"op": "drop_join", "cube": "orders", "to": "customers"},
+                     {"op": "drop_join", "cube": "customers", "to": "states"}, {"op": "drop_cube", "cube": "customers"}))
+    runner.apply(mig("0007_recreate", {"op": "create_cube", "name": "customers", "table": "customers",
+                                       "dimensions": {"customer_id": {"sql": "customer_id", "primary_key": True},
+                                                      "city": "left(customer_city, 1)", "state": "customer_state"},
+                                       "measures": {"unique_customers": "customer_unique_id"}}))
+    masked, _ = _cities(dl, acme)
+    pinned, warnings = _cities(dl, acme, model_version=5)
+    assert pinned == masked and all(len(c) == 1 for c in masked)
+    assert any("customers.city uses the current definition" in w for w in warnings)
 
 
 def test_deprecation_warns(runner, dl, acme):

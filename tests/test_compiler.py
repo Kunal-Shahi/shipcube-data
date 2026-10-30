@@ -447,7 +447,8 @@ def test_pinned_version_does_not_resurrect_dropped_members(runner, dl, acme):
 
 def test_pinned_version_still_restores_old_definitions_through_renames(runner, dl, acme):
     before = dl.query({"measures": ["order_items.revenue"]}, acme)["rows"][0]["order_items__revenue"]
-    apply(runner, "0006_net", {"op": "change_sql", "member": "order_items.revenue", "sql": "price - freight_value"})
+    apply(runner, "0006_net", {"op": "change_sql", "member": "order_items.revenue", "sql": "price - freight_value",
+                               "pin_compatible": True})
     apply(runner, "0007_ren", {"op": "rename_member", "member": "order_items.revenue", "to": "item_revenue"})
     pinned = dl.query({"measures": ["order_items.item_revenue"], "model_version": 5}, acme)["rows"][0]
     assert pinned["order_items__item_revenue"] == before
