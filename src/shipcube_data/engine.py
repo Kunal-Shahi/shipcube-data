@@ -175,7 +175,7 @@ class DataLayer:
             "description": cube.description,
             "measures": [member(m) for m in visible if m.kind == "measure"],
             "dimensions": [member(m) for m in visible if m.kind == "dimension"],
-            "segments": [{"path": f"{cube.name}.{s.name}", "title": s.title or humanize(s.name), "description": s.description} for s in cube.segments.values()],
+            "segments": [{"path": f"{cube.name}.{s.name}", "title": s.title or humanize(s.name), "description": s.description} for s in cube.segments.values() if comp.segment_visible(cube, s.sql)],
             "joins": joins,
             "aliases": {f"{cube.name}.{a}": f"{cube.name}.{t}" for a, t in cube.aliases.items()},
             "partitioned_by": {"column": part.column, "kind": part.kind, "granularity": part.granularity,

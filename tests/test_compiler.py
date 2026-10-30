@@ -195,6 +195,44 @@ def test_member_grants_hide_members_and_what_depends_on_them(dl, acme):
     assert dl.query({"measures": ["order_items.freight", "order_items.gmv"]}, finance)["rows"][0]["order_items__freight"] > 0
 
 
+def test_segments_cannot_read_hidden_members(runner, dl, acme):
+    """shipcube-data #8: a segment over a hidden member's column (raw or {ref}) is a yes/no oracle."""
+    apply(runner, "0006_segments",
+          {"op": "add_dimension", "name": "order_items.freight_paid", "type": "number", "sql": "freight_value"},
+          {"op": "grant_member", "member": "order_items.freight_paid", "roles": ["finance"]},
+          {"op": "add_segment", "name": "order_items.pricey_freight", "sql": "freight_value > 30"},
+          {"op": "add_segment", "name": "order_items.pricey_freight_ref", "sql": "{freight_paid} > 30"},
+          {"op": "add_segment", "name": "order_items.pricey", "sql": "price > 100"})
+    for seg in ("order_items.pricey_freight", "order_items.pricey_freight_ref"):
+        with pytest.raises(ModelError, match=f"not permitted: segment {seg}"):
+            dl.query({"measures": ["order_items.revenue"], "segments": [seg]}, acme)
+    assert dl.query({"measures": ["order_items.revenue"], "segments": ["order_items.pricey"]}, acme)["rows"]
+    shown = {s["path"] for s in dl.describe_cube("order_items", acme)["segments"]}
+    assert shown == {"order_items.pricey"}
+    finance = SecurityContext(tenant="acme", roles=["finance"])
+    assert dl.query({"measures": ["order_items.revenue"], "segments": ["order_items.pricey_freight"]}, finance)["rows"]
+    assert len(dl.describe_cube("order_items", finance)["segments"]) == 3
+
+
+def test_add_segment_needs_an_admin_to_approve():
+    m = Migration.model_validate({"id": "0001_x", "ops": [{"op": "add_segment", "name": "orders.late", "sql": "order_status = 'late'"}]})
+    assert m.kind() == "additive" and m.widens_exposure() == ["add_segment"]
+
+
+@pytest.mark.parametrize("sql", [
+    "query_to_xml('select 1', true, true, '') IS NOT NULL",
+    "table_to_xml('tenant_acme.customers', true, true, '') IS NOT NULL",
+    "dblink_exec('dbname=x', 'drop table y') = 'OK'",
+    "set_config('app.workspace_id', 'x', false) = 'x'",
+    "xpath('/a', '<a/>') IS NOT NULL",
+    "nextval('s') > 0",
+    "some_new_function(price) > 0",
+])
+def test_model_sql_function_allowlist(runner, sql):
+    with pytest.raises(ModelError, match="may not call"):
+        apply(runner, "0006_bad", {"op": "add_segment", "name": "order_items.bad", "sql": sql})
+
+
 def test_ctx_values_are_literals_not_sql(dl):
     ctx = SecurityContext(tenant="acme", roles=["regional_manager"], attrs={"region": "x' OR '1'='1"})
     res = dl.query({"measures": ["orders.count"]}, ctx)

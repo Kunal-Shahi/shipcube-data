@@ -703,6 +703,7 @@ class Migration(BaseModel):
 WIDENS_EXPOSURE = {
     "create_cube", "add_measure", "add_dimension", "add_join", "change_sql", "bind_schema",
     "revoke_member", "drop_row_policy",
+    "add_segment",  # a filter on raw columns: a yes/no oracle over data no member exposes (shipcube-data #8)
 }
 
 
