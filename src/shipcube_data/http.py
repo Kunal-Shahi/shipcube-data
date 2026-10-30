@@ -165,7 +165,7 @@ def cube_body(cube, model, layer, caller: Caller, ctx, admin: bool) -> dict[str,
         "dimensions": [member(m) for m in shown if m.kind == "dimension"],
         "measures": [member(m) for m in shown if m.kind == "measure"],
         "joins": [{"to": e.dst, "relationship": e.relationship, "on": e.on} for e in comp._edges(cube.name)],
-        "segments": [{"name": s.name, "sql": s.sql} for s in cube.segments.values()],
+        "segments": [{"name": s.name, "sql": s.sql} for s in cube.segments.values() if admin or comp.segment_visible(cube, s.sql)],
         **({"partition": partition} if partition else {}),
         "policies": [f"{pol.name}" + (f" (roles: {', '.join(pol.roles)})" if pol.roles else "")
                      for pol in model.policies.values() if pol.cube == cube.name],

@@ -24,7 +24,7 @@ from sqlglot import exp
 from .model import ADDITIVE_AGGS, FANOUT_SAFE_AGGS, IDENT, Cube, Dimension, Measure, Member, Model, ModelError, humanize
 from .partitions import Bounds, prune, timestamp_type, to_date
 from .query import And, Calc, Condition, Filter, Not, Or, Query, filter_members, parse_filter
-from .sqlutil import parse_expr, parse_query, ref_name, refs
+from .sqlutil import parse_expr, parse_query, raw_columns, ref_name, refs, row_reference
 
 DIALECTS = ("duckdb", "postgres", "bigquery", "clickhouse")
 DEFAULT_LIMIT = 10_000
@@ -125,6 +125,27 @@ class Compiler:
             if target and name not in seen and not self.visible(cube, target, seen):
                 return False
         return True
+
+    def hidden_columns(self, cube: Cube) -> set[str]:
+        """Physical columns that members hidden from this caller read."""
+        out: set[str] = set()
+        for m in cube.members():
+            if not self.visible(cube, m):
+                texts = [m.sql or (m.name if m.kind == "dimension" else None), getattr(m, "filter", None)]
+                out |= {c for t in texts if t for c in raw_columns(t, self.src)}
+        return out
+
+    def segment_visible(self, cube: Cube, sql: str) -> bool:
+        """Segments are filters, so they leak through row counts: a segment is usable only if every
+        member it references is visible and it reads no column a hidden member reads (shipcube-data #8).
+        Whole-row and other-relation references are refused here too, for segments stored before add_segment checked."""
+        if row_reference(sql, self.src, set(self.model.cubes)):
+            return False
+        for ref in refs(sql):
+            target = cube.member(ref.rpartition(".")[2])
+            if target is None or not self.visible(cube, target):
+                return False
+        return not (raw_columns(sql, self.src) & self.hidden_columns(cube))
 
     def resolve(self, path: str, granularity: Optional[str] = None) -> _Ref:
         try:
@@ -443,8 +464,8 @@ class Compiler:
         for s in q.segments:
             cube_name, _, name = s.partition(".")
             cube = self.model.cube(cube_name)
-            if name not in cube.segments:
-                raise ModelError(f"unknown segment {s}")
+            if name not in cube.segments or not self.segment_visible(cube, cube.segments[name].sql):
+                raise ModelError(f"unknown or not permitted: segment {s}", "unknown_member")
             segments.append((cube, cube.segments[name]))
 
         groups: dict[str, list[_Ref]] = {}

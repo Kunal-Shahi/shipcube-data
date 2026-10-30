@@ -67,7 +67,7 @@ These console and API actions need a person's console session (`Caller.via == "c
 
 | Function | Who | Does |
 |---|---|---|
-| `DataTools.approve(id, caller)` | admin; a developer only for `additive` migrations that don't widen exposure (in practice metadata and segments). Never the person who proposed it. | Marks a proposal approved |
+| `DataTools.approve(id, caller)` | admin; a developer only for `additive` migrations that don't widen exposure (in practice metadata, partitions and access restrictions). Never the person who proposed it. | Marks a proposal approved |
 | `DataTools.apply(id, caller, allow_breaking=False)` | developer; `allow_breaking=True` needs admin | Re-plans (conflicts, impact), then applies an approved migration |
 | `DataTools.register_datasource(caller, name, kind, secret_ref, options, verified_projects)` | admin | Connects a warehouse from a stored secret reference (see the guards below) |
 | `Runner.rollback(...)` | admin (console or CLI) | Pops the head model version |
@@ -100,7 +100,7 @@ The library also checks, before anything runs:
 | The caller is a workspace member, or is reading through an app. | `forbidden` |
 | The catalog belongs to the caller's workspace. | `forbidden` |
 | `data_propose_migration` needs `developer` or higher. | `forbidden` |
-| Approving needs a human console session, not a token. The approver must be a different **person** from the proposer: an agent's token and its owner's console session are the same person. Developers may approve only `additive` migrations that don't widen exposure; anything that can make more data visible (new cubes, members or joins, `change_sql`, re-binding schemas, revoking grants, dropping row policies) needs `admin`. | `forbidden` |
+| Approving needs a human console session, not a token. The approver must be a different **person** from the proposer: an agent's token and its owner's console session are the same person. Developers may approve only `additive` migrations that don't widen exposure; anything that can make more data visible (new cubes, members, joins or segments, `change_sql`, re-binding schemas, revoking grants, dropping row policies) needs `admin`. A segment filters on raw columns, so its row counts reveal data no member exposes. | `forbidden` |
 
 Data roles and attributes are workspace access settings, not semantic-model changes, so they live outside migrations. The catalog's `assign_role`, `unassign_role` and `set_attribute` record every change in `audit_log`. The console's "Data access" page writes them.
 

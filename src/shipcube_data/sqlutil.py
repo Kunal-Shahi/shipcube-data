@@ -42,6 +42,32 @@ FORBIDDEN_FUNCS = {
 }
 
 
+FORBIDDEN_FUNCS |= {
+    # Postgres: run a query or a statement, change settings, touch sequences (shipcube-data #8)
+    "set_config", "setval", "nextval", "currval", "lastval", "xpath", "xpath_exists", "xmlparse", "txid_current",
+    "current_query", "inet_server_addr", "inet_client_addr", "version",
+}
+FORBIDDEN_PREFIXES = ("read_", "pg_", "lo_", "dblink", "duckdb_", "txid_")
+FORBIDDEN_SUFFIXES = ("_scan", "_to_xml", "_to_xmlschema", "_to_xml_and_xmlschema")
+
+# Functions sqlglot doesn't know (exp.Anonymous) are refused unless listed here, so a new
+# dialect-specific function that runs SQL or reaches outside the warehouse can't slip through a
+# denylist. Functions sqlglot types (SUM, CAST, DATE_TRUNC, UPPER, ...) are checked against the
+# denylist only.
+ALLOWED_UNTYPED_FUNCS = {
+    "abs", "age", "any_value", "array_length", "bool_and", "bool_or", "btrim", "cardinality", "ceil", "ceiling",
+    "char_length", "concat_ws", "contains", "corr", "countif", "date_add", "date_diff", "date_part", "date_sub",
+    "date_trunc", "datediff", "datetime_trunc", "ends_with", "epoch", "epoch_ms", "farm_fingerprint", "format_date",
+    "format_timestamp", "from_unixtime", "greatest", "hash", "ifnull", "initcap", "last_day", "least", "left", "length",
+    "list_contains", "ln", "log", "lpad", "ltrim", "make_date", "md5", "median", "mod", "nullif", "nvl",
+    "octet_length", "parse_date", "parse_timestamp", "percentile_cont", "percentile_disc", "position", "power",
+    "regexp_contains", "regexp_extract", "regexp_matches", "regexp_replace", "repeat", "replace", "reverse",
+    "right", "round", "rpad", "rtrim", "safe_divide", "sha1", "sha256", "sign", "split_part", "sqrt",
+    "starts_with", "stddev", "strpos", "timestamp_trunc", "to_char", "to_date", "to_hex", "to_timestamp",
+    "translate", "trunc", "unix_timestamp", "variance",
+}
+
+
 def func_name(node: exp.Func) -> str:
     return (node.name if isinstance(node, exp.Anonymous) else node.sql_name()).lower()
 
@@ -51,7 +77,9 @@ def forbidden_function(node: exp.Expression) -> str | None:
         return "read_csv"
     if isinstance(node, exp.Func):
         name = func_name(node)
-        if name in FORBIDDEN_FUNCS or name.startswith(("read_", "pg_", "lo_")) or name.endswith("_scan"):
+        if name in FORBIDDEN_FUNCS or name.startswith(FORBIDDEN_PREFIXES) or name.endswith(FORBIDDEN_SUFFIXES):
+            return name
+        if isinstance(node, exp.Anonymous) and name not in ALLOWED_UNTYPED_FUNCS:
             return name
     return None
 
@@ -65,7 +93,35 @@ def check_scalar_sql(tree: exp.Expression, sql: str) -> None:
             raise ModelError(f"model SQL may not contain subqueries or table references: {sql!r}", "invalid_sql")
         bad = forbidden_function(node)
         if bad:
-            raise ModelError(f"model SQL may not call {bad}: {sql!r}", "invalid_sql")
+            raise ModelError(f"model SQL may not call {bad}: {sql!r}", "invalid_sql",
+                             "only standard scalar and aggregate functions are allowed in model SQL")
+
+
+def raw_columns(sql: str, dialect: str) -> set[str]:
+    """Physical columns a snippet reads directly (not through {member} references), lowercased."""
+    return {c.name.lower() for c in parse_expr(sql, dialect).find_all(exp.Column) if ref_name(c) is None}
+
+
+# Relation aliases the compiler itself uses, besides the cube names.
+INTERNAL_ALIASES = {"keys", "base", "raw"}
+
+
+def row_reference(sql: str, dialect: str, relations: set[str]) -> str | None:
+    """A reference in filter SQL that reads a whole row, or another relation's columns: a qualified
+    column (`customers.city`), a star, or a bare name that is a relation alias (`CAST(order_items AS
+    TEXT)` is the whole row in Postgres). Segments may only read their own cube's plain columns."""
+    names = {r.lower() for r in relations} | INTERNAL_ALIASES
+    tree = parse_expr(sql, dialect)
+    if tree.find(exp.Star):
+        return "*"
+    for c in tree.find_all(exp.Column):
+        if ref_name(c) is not None:
+            continue
+        if c.table:
+            return c.sql()
+        if c.name.lower() in names:
+            return c.name
+    return None
 
 
 def ref_name(col: exp.Column) -> str | None:

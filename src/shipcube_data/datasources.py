@@ -193,13 +193,25 @@ def duckdb_connector(ds: Datasource, secret: Optional[str]) -> Executor:
     return DuckDBWarehouse(duckdb.connect(path, read_only=path != ":memory:", config={"enable_external_access": False}))
 
 
+_URL_KEYS = {"host", "port", "dbname", "user", "password", "sslmode"}
+
+
 def postgres_connector(ds: Datasource, secret: Optional[str]) -> Executor:
     """Cloud SQL Postgres (or any Postgres). The secret is the password for options host / port /
     dbname / user / sslmode, or a full libpq URL; either way the final host is checked."""
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
     if secret and secret.startswith(("postgres://", "postgresql://")):
-        params = conninfo_to_dict(secret)
+        try:
+            params = conninfo_to_dict(secret)
+        except Exception:
+            raise ModelError("the warehouse secret is not a valid Postgres URL", "invalid") from None
+        # Only plain connection keys: hostaddr would connect somewhere other than the checked host;
+        # service/passfile/ssl* files read the server's filesystem; options can change session settings.
+        extra = sorted(set(params) - _URL_KEYS)
+        if extra:
+            raise ModelError(f"the warehouse URL may not set {', '.join(extra)}; use host, port, dbname, user, password "
+                             "and sslmode only", "forbidden")
     else:
         o = ds.options
         params = {"host": o.get("host"), "port": o.get("port"), "dbname": o.get("dbname"), "user": o.get("user"),
