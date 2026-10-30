@@ -61,7 +61,7 @@ class ResultCache:
             self.data.popitem(last=False)
 
 
-def pin_definitions(head: Model, pinned: Model) -> Model:
+def pin_definitions(head: Model, pinned: Model, keep_head: frozenset[tuple[str, str]] = frozenset()) -> Model:
     """The model a pinned query runs against: head, with member *definitions* taken from the pin.
 
     Everything that decides who sees what stays at head: grants, row policies, schema bindings,
@@ -69,6 +69,9 @@ def pin_definitions(head: Model, pinned: Model) -> Model:
     that still exists was computed (its SQL, aggregation and filter). Members that no longer
     exist at head are not resurrected. (Red-team issue #2: pinning an old version must never
     bring back old access rules.)
+
+    `keep_head` lists (cube, member) whose definition is an access rule since the pin: a masking
+    `change_sql`, or a member dropped and re-created under the same name. Those keep head's definition.
     """
     out = head.model_copy(deep=True)
     for cube in out.cubes.values():
@@ -80,6 +83,8 @@ def pin_definitions(head: Model, pinned: Model) -> Model:
         for alias, target in cube.aliases.items():
             names_for.setdefault(target, []).append(alias)
         for member in cube.members():
+            if (cube.name, member.name) in keep_head:
+                continue
             old = next((old_cube.member(n) for n in names_for[member.name] if old_cube.member(n)), None)
             if old is None or old.kind != member.kind:
                 continue
@@ -188,9 +193,29 @@ class DataLayer:
     def compile(self, query: Query | dict, ctx: SecurityContext, dialect: Optional[str] = None):
         q = query if isinstance(query, Query) else Query.model_validate(query)
         model = self._model()
+        kept: frozenset[tuple[str, str]] = frozenset()
         if q.model_version is not None and q.model_version != self.catalog.head():
-            model = pin_definitions(model, self._model(q.model_version))
-        return Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q), q
+            kept = self.access_changes_since(model, q.model_version)
+            model = pin_definitions(model, self._model(q.model_version), kept)
+        compiled = Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q)
+        compiled.warnings += [f"{c}.{m} uses the current definition: it was masked or re-created after "
+                              f"model_version {q.model_version}" for c, m in sorted(kept)]
+        return compiled, q
+
+    def access_changes_since(self, head: Model, version: int) -> frozenset[tuple[str, str]]:
+        """Members (by their current names) whose definition became an access rule after `version`:
+        a `change_sql` with `masking`, or a `drop_member` (a member re-created later is a new member,
+        so the pin must not hand back the old one's SQL)."""
+        out: set[tuple[str, str]] = set()
+        for rec in self.catalog.applied_since(version):
+            ops = json.loads(rec["ops"]) if isinstance(rec["ops"], str) else rec["ops"]
+            for op in ops:
+                if (op.get("op") == "change_sql" and op.get("masking")) or op.get("op") == "drop_member":
+                    cube_name, _, name = op["member"].partition(".")
+                    cube = head.cubes.get(cube_name)
+                    if cube is not None:
+                        out.add((cube_name, cube.aliases.get(name, name)))
+        return frozenset(out)
 
     def query(self, query: Query | dict, ctx: SecurityContext, *, use_cache: bool = True) -> dict[str, Any]:
         """Compile, run under the guardrails, and log one `query.ok` / `query.error` event."""

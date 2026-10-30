@@ -181,7 +181,7 @@ Data roles and attributes are **not** versioned or migration-managed. They are a
 
 ### 4.3 Why SCD2
 
-- **Point-in-time models.** `load(version=v)` selects rows with `since <= v AND (until IS NULL OR until > v)`. A query can pin `model_version` to keep a member's *definition* while a migration rolls out. `test_change_sql_is_versioned_and_pinnable` covers this. A pin never brings back old access rules: grants, row policies, schema bindings, joins and partitions always come from head (`engine.pin_definitions`; red-team issue #2).
+- **Point-in-time models.** `load(version=v)` selects rows with `since <= v AND (until IS NULL OR until > v)`. A query can pin `model_version` to keep a member's *definition* while a migration rolls out. `test_change_sql_is_versioned_and_pinnable` covers this. A pin never brings back old access rules: grants, row policies, schema bindings, joins and partitions always come from head (`engine.pin_definitions`; red-team issue #2). A masking `change_sql` (`"masking": true`) counts as an access rule, so is a member dropped and re-created after the pin. Those members keep head's definition under any pin (shipcube-data #8).
 - **Generic, exact rollback.** To undo the head version `v`:
   - delete rows with `since = v`;
   - set `until = NULL` on rows with `until = v`;
@@ -201,7 +201,7 @@ Data roles and attributes are **not** versioned or migration-managed. They are a
 
 The compiler is in `compiler.py`. Its steps, in order:
 
-1. **Load the model** at head. If the query pins `model_version`, take only member definitions (SQL, aggregation, filter) from that version, for members that still exist at head; access rules always come from head.
+1. **Load the model** at head. If the query pins `model_version`, take only member definitions (SQL, aggregation, filter) from that version, for members that still exist at head and haven't been masked or re-created since; access rules always come from head.
 2. **Resolve members.** For each `cube.member`:
    - Follow rename aliases and warn that the query should be updated.
    - Warn on deprecation, naming `replaced_by`.

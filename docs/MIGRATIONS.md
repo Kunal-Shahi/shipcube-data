@@ -83,7 +83,7 @@ A migration's kind is the most severe kind among its ops. The kind feeds the app
 | `add_dimension` | `name`, `sql` | `type`, `primary_key`, `title`, `description`, `format` | additive |
 | `rename_member` | `member`, `to` | | change |
 | `deprecate_member` | `member` | `reason`, `replaced_by` | change |
-| `change_sql` | `member`, `sql` | `agg`, `filter` | change |
+| `change_sql` | `member`, `sql` | `agg`, `filter`, `masking` | change |
 | `drop_member` | `member` | | breaking |
 | `set_meta` | `target` (`cube` or `cube.member`) | `title`, `description`, `format` | additive |
 
@@ -103,6 +103,8 @@ A migration's kind is the most severe kind among its ops. The kind feeds the app
 - Follows alias chains (`a → b → c`).
 
 **`change_sql`** closes the old definition at this version and opens a new one (SCD2). Queries can pin `model_version` to keep the old meaning while apps move over.
+
+Set `"masking": true` when the change is an access rule rather than a restatement, for example hashing, truncating or redacting a value. A query pinned to an earlier version then gets the masked definition too, with a warning. Without the flag, the pin would bring back the unmasked SQL. The same applies to a member that was dropped after the pin and re-created under the same name: the pin never restores the old member's SQL.
 
 **`deprecate_member`** keeps the member working. Every query that uses it gets `"orders.x is deprecated (reason); use orders.y"`, and `describe_cube` shows the deprecation to agents.
 

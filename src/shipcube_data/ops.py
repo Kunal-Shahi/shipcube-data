@@ -375,6 +375,9 @@ class ChangeSql(_Op):
     sql: str
     agg: Optional[Agg] = None
     filter: Optional[str] = None
+    # An access change (hashing, truncating or redacting a value), not a restatement: queries
+    # pinned to an older version get this definition too, never the unmasked one (shipcube-data #8).
+    masking: bool = False
     kind: Kind = "change"
 
     def apply(self, model: Model, dialect: str) -> None:
