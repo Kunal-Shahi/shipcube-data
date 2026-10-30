@@ -375,9 +375,10 @@ class ChangeSql(_Op):
     sql: str
     agg: Optional[Agg] = None
     filter: Optional[str] = None
-    # An access change (hashing, truncating or redacting a value), not a restatement: queries
-    # pinned to an older version get this definition too, never the unmasked one (shipcube-data #8).
-    masking: bool = False
+    # Queries pinned to an older version get this new definition too, unless the approver marks the
+    # change as a restatement that's safe to undo under a pin. Fails closed: a forgotten flag can't
+    # leave masked or redacted SQL reachable through an old pin (shipcube-data #8).
+    pin_compatible: bool = False
     kind: Kind = "change"
 
     def apply(self, model: Model, dialect: str) -> None:

@@ -70,8 +70,8 @@ def pin_definitions(head: Model, pinned: Model, keep_head: frozenset[tuple[str, 
     exist at head are not resurrected. (Red-team issue #2: pinning an old version must never
     bring back old access rules.)
 
-    `keep_head` lists (cube, member) whose definition is an access rule since the pin: a masking
-    `change_sql`, or a member dropped and re-created under the same name. Those keep head's definition.
+    `keep_head` lists (cube, member) that keep head's definition: changed since the pin by a
+    `change_sql` not marked `pin_compatible`, or dropped (or in a dropped cube) and re-created.
     """
     out = head.model_copy(deep=True)
     for cube in out.cubes.values():
@@ -198,19 +198,29 @@ class DataLayer:
             kept = self.access_changes_since(model, q.model_version)
             model = pin_definitions(model, self._model(q.model_version), kept)
         compiled = Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q)
-        compiled.warnings += [f"{c}.{m} uses the current definition: it was masked or re-created after "
-                              f"model_version {q.model_version}" for c, m in sorted(kept)]
+        used = set()
+        for col in compiled.columns:
+            if col.kind != "calc":
+                cube, member = model.resolve(col.member)
+                used.add((cube.name, member.name))
+        compiled.warnings += [f"{c}.{m} uses the current definition: it changed after model_version {q.model_version}"
+                              for c, m in sorted(kept & used)]
         return compiled, q
 
     def access_changes_since(self, head: Model, version: int) -> frozenset[tuple[str, str]]:
-        """Members (by their current names) whose definition became an access rule after `version`:
-        a `change_sql` with `masking`, or a `drop_member` (a member re-created later is a new member,
-        so the pin must not hand back the old one's SQL)."""
+        """Members (by their current names) a pin to `version` must not restore:
+        * changed by a `change_sql` that isn't `pin_compatible` (the default: it may mask or redact);
+        * dropped, or in a dropped cube: anything re-created under the name later is new, and the
+          pin must not hand back the old SQL."""
         out: set[tuple[str, str]] = set()
         for rec in self.catalog.applied_since(version):
             ops = json.loads(rec["ops"]) if isinstance(rec["ops"], str) else rec["ops"]
             for op in ops:
-                if (op.get("op") == "change_sql" and op.get("masking")) or op.get("op") == "drop_member":
+                kind = op.get("op")
+                if kind == "drop_cube":
+                    cube = head.cubes.get(op["cube"])
+                    out |= {(cube.name, m.name) for m in cube.members()} if cube else set()
+                elif (kind == "change_sql" and not op.get("pin_compatible")) or kind == "drop_member":
                     cube_name, _, name = op["member"].partition(".")
                     cube = head.cubes.get(cube_name)
                     if cube is not None:

@@ -35,7 +35,7 @@ Tests run on SQLite and Postgres catalogs. Integration tests run the same govern
 4. **Changes are safe to make.**
    - A dry-run reports which saved queries and apps would break or return different numbers.
    - Renames keep the old name working.
-   - Definition changes are versioned, so a pinned query keeps its old meaning.
+   - Definition changes are versioned, so a pinned query keeps its old meaning when the change is marked `pin_compatible`.
    - Two migrations that touch the same member are detected as a conflict.
 5. **Agents propose and humans approve.** An LLM can write a migration and see its impact. A different principal must approve it before it is applied.
 6. **One warehouse with many schemas and partitions.** Cubes are defined once against logical tables. Each query is routed to the caller's tenant schema and reads only the partitions it needs.
@@ -181,7 +181,7 @@ Data roles and attributes are **not** versioned or migration-managed. They are a
 
 ### 4.3 Why SCD2
 
-- **Point-in-time models.** `load(version=v)` selects rows with `since <= v AND (until IS NULL OR until > v)`. A query can pin `model_version` to keep a member's *definition* while a migration rolls out. `test_change_sql_is_versioned_and_pinnable` covers this. A pin never brings back old access rules: grants, row policies, schema bindings, joins and partitions always come from head (`engine.pin_definitions`; red-team issue #2). A masking `change_sql` (`"masking": true`) counts as an access rule, so is a member dropped and re-created after the pin. Those members keep head's definition under any pin (shipcube-data #8).
+- **Point-in-time models.** `load(version=v)` selects rows with `since <= v AND (until IS NULL OR until > v)`. A query can pin `model_version` to keep a member's *definition* while a migration rolls out. `test_change_sql_is_versioned_and_pinnable` covers this. A pin never brings back old access rules: grants, row policies, schema bindings, joins and partitions always come from head (`engine.pin_definitions`; red-team issue #2). Member definitions fail closed too: a pin restores a member's old SQL only across `change_sql`s marked `pin_compatible`. Any other `change_sql` might mask or redact. A member dropped after the pin, or one in a cube dropped after the pin, is new even under the same name. All of these keep head's definition under any pin, with a warning (shipcube-data #8).
 - **Generic, exact rollback.** To undo the head version `v`:
   - delete rows with `since = v`;
   - set `until = NULL` on rows with `until = v`;
@@ -201,7 +201,7 @@ Data roles and attributes are **not** versioned or migration-managed. They are a
 
 The compiler is in `compiler.py`. Its steps, in order:
 
-1. **Load the model** at head. If the query pins `model_version`, take only member definitions (SQL, aggregation, filter) from that version, for members that still exist at head and haven't been masked or re-created since; access rules always come from head.
+1. **Load the model** at head. If the query pins `model_version`, take only member definitions (SQL, aggregation, filter) from that version, for members that still exist at head and were only changed by `pin_compatible` `change_sql`s since; access rules always come from head.
 2. **Resolve members.** For each `cube.member`:
    - Follow rename aliases and warn that the query should be updated.
    - Warn on deprecation, naming `replaced_by`.

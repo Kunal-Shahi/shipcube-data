@@ -83,7 +83,7 @@ A migration's kind is the most severe kind among its ops. The kind feeds the app
 | `add_dimension` | `name`, `sql` | `type`, `primary_key`, `title`, `description`, `format` | additive |
 | `rename_member` | `member`, `to` | | change |
 | `deprecate_member` | `member` | `reason`, `replaced_by` | change |
-| `change_sql` | `member`, `sql` | `agg`, `filter`, `masking` | change |
+| `change_sql` | `member`, `sql` | `agg`, `filter`, `pin_compatible` | change |
 | `drop_member` | `member` | | breaking |
 | `set_meta` | `target` (`cube` or `cube.member`) | `title`, `description`, `format` | additive |
 
@@ -102,9 +102,11 @@ A migration's kind is the most severe kind among its ops. The kind feeds the app
 - Rewrites `{old}` references in the cube's members, segments and policies.
 - Follows alias chains (`a → b → c`).
 
-**`change_sql`** closes the old definition at this version and opens a new one (SCD2). Queries can pin `model_version` to keep the old meaning while apps move over.
+**`change_sql`** closes the old definition at this version and opens a new one (SCD2). The old definition stays in the catalog.
 
-Set `"masking": true` when the change is an access rule rather than a restatement, for example hashing, truncating or redacting a value. A query pinned to an earlier version then gets the masked definition too, with a warning. Without the flag, the pin would bring back the unmasked SQL. The same applies to a member that was dropped after the pin and re-created under the same name: the pin never restores the old member's SQL.
+By default a query pinned to an earlier `model_version` gets the **new** definition, with a warning. A change might mask, hash or redact a value, and a pin must never bring the unmasked SQL back, so a forgotten flag fails closed. To let pinned queries keep the old meaning while apps move over, mark the change `"pin_compatible": true`. That says the change is a restatement and the old SQL is safe to run again. The admin who approves the change reviews the flag.
+
+Pins never restore the SQL of a member that was dropped after the pin, or of any member of a cube dropped after the pin, even if something was re-created under the same name.
 
 **`deprecate_member`** keeps the member working. Every query that uses it gets `"orders.x is deprecated (reason); use orders.y"`, and `describe_cube` shows the deprecation to agents.
 
