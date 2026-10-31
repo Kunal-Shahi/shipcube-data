@@ -8,13 +8,14 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Optional
 
-from . import rawsql
+from . import govsql, rawsql
 from .catalog import Catalog
-from .compiler import Compiler, SecurityContext
+from .compiler import DEFAULT_LIMIT, Compiler, SecurityContext
 from .migrate import Runner
 from .model import Model, ModelError, humanize
 from .obs import Metrics, NoMetrics, Timer, log_event, new_query_id, sql_hash
 from .query import Condition, Order, Query
+from .stages import StageCompiler, StagedQuery
 from .warehouses import DuckDBWarehouse, Executor, QueryLimits
 
 
@@ -190,14 +191,21 @@ class DataLayer:
 
     # ------------------------------------------------------------ querying
 
-    def compile(self, query: Query | dict, ctx: SecurityContext, dialect: Optional[str] = None):
+    def compile(self, query: Query | StagedQuery | dict, ctx: SecurityContext, dialect: Optional[str] = None,
+                as_stage: bool = False, default_limit: int = DEFAULT_LIMIT):
+        if isinstance(query, StagedQuery) or (isinstance(query, dict) and "stages" in query):
+            sq = query if isinstance(query, StagedQuery) else StagedQuery.model_validate(query)
+            model = self._model()
+            stages = StageCompiler(Compiler(model, ctx, dialect or self.dialect, self.dialect),
+                                   lambda q: self.compile(q, ctx, dialect, as_stage=True)[0], set(model.cubes))
+            return stages.compile(sq, default_limit), sq
         q = query if isinstance(query, Query) else Query.model_validate(query)
         model = self._model()
         kept: frozenset[tuple[str, str]] = frozenset()
         if q.model_version is not None and q.model_version != self.catalog.head():
             kept = self.access_changes_since(model, q.model_version)
             model = pin_definitions(model, self._model(q.model_version), kept)
-        compiled = Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q)
+        compiled = Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q, as_stage=as_stage)
         used = set()
         for col in compiled.columns:
             if col.kind != "calc":
@@ -227,20 +235,22 @@ class DataLayer:
                         out.add((cube_name, cube.aliases.get(name, name)))
         return frozenset(out)
 
-    def query(self, query: Query | dict, ctx: SecurityContext, *, use_cache: bool = True) -> dict[str, Any]:
+    def query(self, query: Query | StagedQuery | dict, ctx: SecurityContext, *, use_cache: bool = True) -> dict[str, Any]:
         """Compile, run under the guardrails, and log one `query.ok` / `query.error` event."""
         query_id = new_query_id()
         timer = Timer().__enter__()
         fields: dict[str, Any] = {"query_id": query_id, "tenant": ctx.tenant, "workspace_id": ctx.attrs.get("workspace_id"),
                                   "user": ctx.user, "dialect": self.dialect}
         try:
-            q = query if isinstance(query, Query) else Query.model_validate(query)
+            staged = isinstance(query, StagedQuery) or (isinstance(query, dict) and "stages" in query)
+            q = query if isinstance(query, (Query, StagedQuery)) else (StagedQuery if staged else Query).model_validate(query)
             if q.limit and q.limit > self.limits.max_rows:
                 raise ModelError(f"limit {q.limit} is over this workspace's row limit of {self.limits.max_rows}", "invalid")
             if not q.limit:
                 q = q.model_copy(update={"limit": self.limits.max_rows})
             compiled, q = self.compile(q, ctx)
-            version = q.model_version or self.catalog.head()
+            version = getattr(q, "model_version", None) or self.catalog.head()
+            fields["query_level"] = "L2" if staged else "L0"
             fields |= {"cubes": compiled.cubes, "fingerprint": compiled.fingerprint, "model_version": version,
                        "sql_hash": sql_hash(compiled.sql),
                        "partitions_scanned": {c: p.get("scanned") for c, p in compiled.partitions.items()}}
@@ -288,6 +298,7 @@ class DataLayer:
             "partitions": compiled.partitions,
             "warnings": warnings,
             "verified": True,
+            "level": fields["query_level"],
             "cache": "hit" if hit else "miss",
             "stats": {"elapsed_ms": elapsed, **stats},
         }
@@ -303,6 +314,27 @@ class DataLayer:
         res = self.query(q, ctx)
         col = res["columns"][0]["name"]
         return [r[col] for r in res["rows"]]
+
+    def governed_sql(self, sql: str, ctx: SecurityContext, limit: Optional[int] = None) -> dict[str, Any]:
+        """Any read-only SELECT over cube names, rewritten so tenant routing, grants and row policies hold (govsql.py)."""
+        query_id = new_query_id()
+        limit = min(limit or self.limits.max_rows, self.limits.max_rows)
+        timer = Timer().__enter__()
+        try:
+            safe, warnings = govsql.rewrite(sql, self._model(), ctx, self.dialect, self.dialect, limit)
+            res = self.execute(safe, self.limits, query_id)
+        except ModelError as e:
+            log_event("governed_sql.error", level=30, query_id=query_id, tenant=ctx.tenant, code=e.code, error=str(e)[:300])
+            raise
+        log_event("governed_sql.ok", query_id=query_id, tenant=ctx.tenant, user=ctx.user, sql_hash=sql_hash(safe),
+                  rows=len(res.rows), elapsed_ms=timer.elapsed_ms)
+        warnings = warnings + ["governed SQL: tenant, grants and row policies are enforced, but joins you write "
+                               "aren't checked for double counting; numbers may not match governed metrics"]
+        if res.truncated:
+            warnings.append(f"result truncated at {limit} rows")
+        return {"query_id": query_id, "columns": [{"name": n} for n in res.columns],
+                "rows": [dict(zip(res.columns, r)) for r in res.rows], "sql": safe, "truncated": res.truncated,
+                "verified": False, "governed": True, "level": "SQL", "warnings": warnings, "stats": {"elapsed_ms": timer.elapsed_ms}}
 
     def raw_sql(self, sql: str, ctx: SecurityContext, limit: int = 1000) -> dict[str, Any]:
         query_id = new_query_id()

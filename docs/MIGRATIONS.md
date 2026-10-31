@@ -133,7 +133,7 @@ Pins never restore the SQL of a member that was dropped after the pin, or of any
 
 | Op | Required | Optional | Kind |
 |---|---|---|---|
-| `bind_schema` | `schema` | `cube` (default `*`), `tenant` (default `*`), `tenant_column` | change |
+| `bind_schema` | `schema` | `cube` (default `*`), `tenant` (default `*`), `tenant_column`, `shared` | change |
 | `define_partition` | `cube`, one of `column` / `dimension` | `granularity`, `values`, `table_pattern`, `start`, `end`, `column_type`, `require_filter` | change |
 
 **`bind_schema`:**
@@ -142,10 +142,14 @@ Pins never restore the SQL of a member that was dropped after the pin, or of any
 - `schema` may contain `{tenant}`.
 - Binding the same `(cube, tenant)` again replaces the binding.
 - `tenant_column` switches to pooled tenancy: shared tables, filtered by that column.
+- **Tenant isolation is explicit.** A binding for every tenant (`tenant: "*"`) with neither a `{tenant}` schema nor a `tenant_column` gives every tenant the same rows. That's right for reference data and dangerous by accident, so it must say `"shared": true`.
+  - An unmarked one is refused by every query that reads it: typed, staged and governed SQL alike. Raw SQL doesn't see its schema.
+  - Re-bind with the flag to fix it.
+  - `shared` on a tenant-isolated binding is an error.
 
 ```json
 {"op": "bind_schema", "schema": "tenant_{tenant}"}
-{"op": "bind_schema", "cube": "states", "schema": "shared"}
+{"op": "bind_schema", "cube": "states", "schema": "shared", "shared": true}
 {"op": "bind_schema", "tenant": "bigco", "schema": "bigco_dedicated"}
 ```
 

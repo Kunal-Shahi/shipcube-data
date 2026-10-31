@@ -43,6 +43,35 @@ QUERIES = {
                                       {"name": "ma2", "op": "moving_avg", "measure": "order_items.revenue", "window": 2,
                                        "by": ["states.region"]}],
                             "order": [{"member": "states.region"}, {"member": "orders.purchased_at"}]},
+    # L2: cohort retention (portable month arithmetic), a pivot and a rolling window over a stage.
+    "l2_cohorts": {"stages": {
+        "activity": {"query": {"measures": ["orders.count"], "dimensions": ["customers.customer_id"],
+                               "time": {"dimension": "orders.purchased_at", "granularity": "month"}}},
+        "first": {"from": "activity", "group": {"by": ["customers.customer_id"],
+                                                 "agg": {"cohort": {"fn": "min", "of": "orders.purchased_at.month"}}}},
+        "joined": {"from": "activity", "as": "a", "join": [{"stage": "first", "as": "f", "on": [["a.customers.customer_id", "f.customer_id"]]}],
+                   "select": {"cohort": "f.cohort", "customer_id": "a.customers.customer_id",
+                              "k": {"date_diff": ["month", "f.cohort", "a.orders.purchased_at.month"]}}},
+        "retention": {"from": "joined", "group": {"by": ["cohort", "k"], "agg": {"customers": {"fn": "count_distinct", "of": "customer_id"}}}}},
+        "output": "retention", "order": [{"column": "cohort"}, {"column": "k"}]},
+    "l2_pivot_rolling": {"stages": {
+        "by_status": {"query": {"measures": ["orders.count"], "dimensions": ["orders.status"],
+                                "time": {"dimension": "orders.purchased_at", "granularity": "quarter"}}},
+        "wide": {"from": "by_status", "pivot": {"index": ["orders.purchased_at.quarter"], "column": "orders.status",
+                                                "values": ["delivered", "canceled"], "agg": {"fn": "sum", "of": "orders.count"}}},
+        "trend": {"from": "wide", "select": {
+            "q": "quarter", "delivered": "status_delivered",
+            "ma2": {"window": {"fn": "avg", "of": "status_delivered", "order": ["quarter"], "frame": [-1, 0]}},
+            "share": {"div": ["status_delivered", {"fn": {"name": "coalesce", "args": [{"add": ["status_delivered", "status_canceled"]}, 0]}}]}}}},
+        "output": "trend", "order": [{"column": "q"}]},
+}
+GOVERNED_SQL = {
+    "status_counts": "SELECT status, count(*) AS n FROM orders GROUP BY status ORDER BY status",
+    "revenue_by_region": """SELECT s.region, SUM(i.revenue) AS revenue FROM order_items i JOIN orders o USING (order_id)
+                            JOIN customers c ON c.customer_id = o.customer_id JOIN states s ON s.code = c.state
+                            GROUP BY 1 ORDER BY 1""",
+    "rolling": """WITH m AS (SELECT date_trunc('month', purchased_at) AS mo, count(*) AS n FROM orders GROUP BY 1)
+                  SELECT mo, n, avg(n) OVER (ORDER BY mo ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ma3 FROM m ORDER BY mo""",
 }
 CONTEXTS = {
     "acme": SecurityContext(tenant="acme", roles=["analyst"]),
@@ -68,7 +97,7 @@ def model_catalog(dialect: str, prefix: str) -> Catalog:
     if prefix:
         r.apply(Migration.model_validate({"id": "0100_route_test_run", "ops": [
             {"op": "bind_schema", "schema": f"{prefix}tenant_{{tenant}}"},
-            {"op": "bind_schema", "cube": "states", "schema": f"{prefix}shared"},
+            {"op": "bind_schema", "cube": "states", "schema": f"{prefix}shared", "shared": True},
         ]}))
     return cat
 
@@ -88,3 +117,8 @@ def assert_same_answers(layer: DataLayer, reference: DataLayer) -> None:
             assert normalize(got["rows"]) == normalize(want["rows"]), (name, ctx_name, got["sql"])
             seen_rows += len(got["rows"])
         assert seen_rows, (name, "returned no rows in any context; the check would be vacuous")
+    for name, sql in GOVERNED_SQL.items():
+        for ctx_name, ctx in CONTEXTS.items():
+            got = layer.governed_sql(sql, ctx)
+            want = reference.governed_sql(sql, ctx)
+            assert normalize(got["rows"]) == normalize(want["rows"]), (name, ctx_name, got["sql"])

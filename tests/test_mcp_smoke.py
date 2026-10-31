@@ -81,7 +81,7 @@ def test_mcp_smoke_end_to_end(server):
                                           "data_search_values", "data_propose_migration", "agent cannot apply"]
     assert all(good for _, good, _ in results), results
     cat = tools.layer_for(uuid.UUID(ws)).catalog
-    assert cat.head() == 5 and [m["status"] for m in cat.migrations("proposed")] == ["proposed"]
+    assert cat.head() == 6 and [m["status"] for m in cat.migrations("proposed")] == ["proposed"]
 
 
 def test_mcp_smoke_reports_a_missing_tool(server, monkeypatch):

@@ -292,6 +292,7 @@ class Compiler:
         )
         if binding is None:
             raise ModelError(f"no schema binding for cube {cube.name} and tenant {tenant}", "forbidden")
+        binding.check_tenancy()  # fail closed on bindings from before `shared` existed
         return binding.schema_.replace("{tenant}", tenant), binding.tenant_column
 
     def source(self, cube: Cube, bounds: Bounds) -> tuple[exp.Expression, list[exp.Expression]]:
@@ -432,7 +433,8 @@ class Compiler:
 
     # ------------------------------------------------------------ L0
 
-    def compile(self, q: Query) -> Compiled:
+    def compile(self, q: Query, as_stage: bool = False) -> Compiled:
+        """`as_stage`: an L2 stage, so no default order or row cap (the staged query's own limit applies)."""
         dims = [self.resolve(d) for d in q.dimensions]
         time_ref: Optional[_Ref] = None
         if q.time:
@@ -496,7 +498,7 @@ class Compiler:
             body, calc_cols = self._calcs(body, q, dims, measures, time_ref)
             columns += calc_cols
 
-        order = q.order or self._default_order(dims, measures, time_ref)
+        order = q.order or ([] if as_stage else self._default_order(dims, measures, time_ref))
         names = {c.member: c.name for c in columns if c.kind != "calc" and not c.granularity}
         for c in columns:  # ordering by a time member's path means its truncated column
             if c.granularity:
@@ -513,10 +515,11 @@ class Compiler:
                 if key not in names:
                     raise ModelError(f"cannot order by {o.member}: it is not in the query")
             body = body.order_by(exp.Ordered(this=exp.column(names[key]), desc=o.dir == "desc"), copy=False)
-        body = body.limit(q.limit or DEFAULT_LIMIT, copy=False)
+        if q.limit or not as_stage:
+            body = body.limit(q.limit or DEFAULT_LIMIT, copy=False)
         if q.offset:
             body = body.offset(q.offset, copy=False)
-        if not q.limit:
+        if not q.limit and not as_stage:
             self.warnings.append(f"no limit given; capped at {DEFAULT_LIMIT} rows")
 
         return Compiled(

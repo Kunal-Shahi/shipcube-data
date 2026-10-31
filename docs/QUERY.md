@@ -1,15 +1,16 @@
 # Query language
 
-Queries are JSON documents validated by Pydantic (`src/shipcube_data/query.py`). They compile to sqlglot expressions (`compiler.py`) and render for one of four dialects. The language has four levels. Each level adds power and loses some of the guarantees of the level below it.
+Queries are JSON documents validated by Pydantic (`src/shipcube_data/query.py`, `stages.py`). They compile to sqlglot expressions and render for one of four dialects. Each level adds power and gives up some of the guarantees of the level below it.
 
 | Level | Adds | Guarantees | Built |
 |---|---|---|---|
 | **L0** | Typed measures, dimensions, filters, time, segments, order, limit | Governed definitions, joins chosen by the model, fan-out safety, RLS, routing, pruning | ✅ |
-| **L1** | Operators: `share`, `rank`, `lag`, `running`, `compare` | Same as L0. Operators work on L0 output columns only. | ✅ |
-| **L2** | Stages: CTEs, set operations, aliased self-joins, subqueries | Every stage that reads data is an L0/L1 query, so it is still governed | Next (specified below) |
-| **L3** | Read-only raw SQL | Only scoping: one SELECT, own schemas, no table functions. Results are labelled `verified: false`. | ✅ (validator) |
+| **L1** | Operators: `share`, `rank`, `lag`, `running`, `compare`, `moving_avg` | Same as L0. Operators work on L0 output columns only. | ✅ |
+| **L2** | Stages: joins, derived columns, any window, re-aggregation, pivots, set operations, semi-joins | Every stage that reads data is an L0/L1 query, so it is still governed. `verified: true` | ✅ |
+| **SQL** | Any read-only SELECT over cube names | Tenant, grants and row policies by rewriting each cube into its governed view. Your joins aren't checked for fan-out: `verified: false`, `governed: true` | ✅ |
+| **L3** | Read-only raw SQL over physical tables | Only scoping: one SELECT, own schemas, no table functions, refused under row policies. `verified: false` | ✅ (off by default) |
 
-No level has company-specific metric kinds. Funnels, cohorts and retention are built from L1 and L2.
+There are no company-specific metric kinds. Funnels, cohorts and retention are compositions of L2 stages, or governed SQL. New analytical patterns shouldn't need new operators: L1's operators are shorthands for what L2's `window` expression does in general.
 
 ---
 
@@ -121,46 +122,116 @@ Suppose a group would have to walk a `one_to_many` edge, such as `orders.count` 
 
 ---
 
-## L2: stages (specified; next to build)
+## L2: stages
 
-L2 composes named stages. **Every stage that reads data is an L0/L1 query**, so routing, RLS, grants and pruning still apply. The remaining stage kinds only work on the columns of earlier stages. This is how L2 adds power without opening a way around governance.
+L2 composes named stages into one query. **Every stage that reads data is an L0/L1 query**, compiled by the regular compiler, so routing, row policies, grants, fan-out checks and pruning apply inside it. The other stage kinds only see the columns of earlier stages. Expressions are a typed JSON tree, never SQL text. This is how L2 adds power without opening a way around governance (`stages.py`).
 
 ```json
 {
   "stages": {
-    "y2017": {"query": {"measures": ["orders.count"], "dimensions": ["customers.customer_id"],
-                        "time": {"dimension": "orders.purchased_at", "range": ["2017-01-01", "2017-12-31"]}}},
-    "y2018": {"query": {"measures": ["orders.count"], "dimensions": ["customers.customer_id"],
-                        "time": {"dimension": "orders.purchased_at", "range": ["2018-01-01", "2018-12-31"]}}},
-    "growers": {
-      "from": "y2018", "as": "cur",
-      "join": [{"stage": "y2017", "as": "prev", "type": "left", "on": [["cur.customers__customer_id", "prev.customers__customer_id"]]}],
-      "select": {"customer_id": "cur.customers__customer_id", "orders_2018": "cur.orders__count", "orders_2017": "prev.orders__count"},
-      "where": [{"column": "orders_2018", "op": "gt", "column_ref": "orders_2017"}]
-    }
+    "activity":  {"query": {"measures": ["orders.count"], "dimensions": ["customers.customer_id"],
+                            "time": {"dimension": "orders.purchased_at", "granularity": "month"}}},
+    "first":     {"from": "activity", "group": {"by": ["customers.customer_id"],
+                                                 "agg": {"cohort": {"fn": "min", "of": "orders.purchased_at.month"}}}},
+    "joined":    {"from": "activity", "as": "a",
+                  "join": [{"stage": "first", "as": "f", "on": [["a.customers.customer_id", "f.customer_id"]]}],
+                  "select": {"cohort": "f.cohort", "customer_id": "a.customers.customer_id",
+                             "k": {"date_diff": ["month", "f.cohort", "a.orders.purchased_at.month"]}}},
+    "retention": {"from": "joined", "group": {"by": ["cohort", "k"],
+                                               "agg": {"customers": {"fn": "count_distinct", "of": "customer_id"}}}}
   },
-  "output": "growers",
-  "order": [{"column": "orders_2018", "dir": "desc"}],
-  "limit": 50
+  "output": "retention",
+  "order": [{"column": "cohort"}, {"column": "k"}],
+  "limit": 500
 }
 ```
 
-| Stage kind | Fields | Compiles to |
+Stages are compiled in order, and a stage may use only earlier ones. Up to 30 stages.
+
+| Stage | Fields | Compiles to |
 |---|---|---|
-| **query** | `query` (L0/L1) | A CTE holding the compiled L0/L1 SQL |
-| **from/join** | `from`, `as`, `join[{stage, as, type, on}]` | Joins between CTEs. The same stage may appear twice under different aliases (self-join). |
-| **select** | `{name: column-or-expression}` | Projection. Expressions are a whitelisted, typed arithmetic tree (`{"div": [a, b]}`), not SQL strings. |
-| **where** | Conditions over columns. `column_ref` compares two columns. | `WHERE` |
-| **group** | `{"by": [...], "agg": {name: {"sum": column}}}` | Re-aggregation over a stage. For example, "average monthly revenue": monthly sum, then average. |
-| **set** | `{"union_all" \| "union" \| "intersect" \| "except": [stage, …]}` | Set operations. The column lists must match by name and type. |
-| **in_stage** filter | `{"column": c, "op": "in_stage", "stage": s, "stage_column": c2}` | `c IN (SELECT c2 FROM s)` as a semi-join subquery. Also `not_in_stage`. |
+| **query** | `query`: an L0/L1 query | A CTE with the compiled query (no default row cap inside) |
+| **from** | `from`, `as`, `join[{stage, as, type: inner/left/right/full/cross, on: [[a, b], …]}]` | Joins between earlier stages; a stage may appear twice under different aliases |
+| | `where`: conditions on the joined columns | `WHERE` |
+| | `select`: `{name: expression}` (default: every column) and `distinct` | Projection, evaluated before `group` |
+| | `group`: `{by: [columns], agg: {name: {fn, of}}}` | Re-aggregation of the selected rows. `fn`: sum, avg, min, max, count (rows without `of`), count_distinct, median, stddev, variance |
+| | `pivot`: `{index, column, values, agg, prefix}` | One output column per listed value, `<prefix>_<value>` (conditional aggregation, so it's portable). Takes `from` and `where` only |
+| | `having`: conditions on the stage's output | Filters after select/group: a window rank, an aggregate |
+| | `order`, `limit` | Per-stage ordering and cap (top-N) |
+| **set** | `union_all`, `union`, `intersect` or `except`: `[stage, …]` | Set operations; the column lists must match by name and order |
+
+**Column references** are strings: `alias.column`, or just `column` when it's unambiguous. A query stage's columns can be named by output name (`orders__count`) or by member path (`orders.count`, `orders.purchased_at.month`). Group and pivot outputs take the reference's last segment (`orders.purchased_at.quarter` → `quarter`).
+
+**Expressions**: a column reference, a number, `true`/`false`/`null`, or one operator object:
+
+| Operator | Example | Notes |
+|---|---|---|
+| `lit` | `{"lit": "delivered"}` | A string literal (bare strings are column references) |
+| `add`, `sub`, `mul` | `{"add": ["a", "b", 1]}` | |
+| `div` | `{"div": ["a", "b"]}` | Floating point, and `NULL` instead of an error on zero |
+| `neg` | `{"neg": "a"}` | |
+| `fn` | `{"fn": {"name": "coalesce", "args": ["a", 0]}}` | coalesce, nullif, abs, round, floor, ceil, ln, exp, sqrt, power, sign, greatest, least, lower, upper, length, concat |
+| `cast` | `{"cast": ["a", "number"]}` | number, integer, string, date, timestamp, boolean |
+| `date_trunc` | `{"date_trunc": ["week", "t"]}` | day, week (Monday), month, quarter, year |
+| `date_diff` | `{"date_diff": ["month", "start", "end"]}` | Unit boundaries crossed, computed from date parts, so every dialect agrees |
+| `date_add` | `{"date_add": ["month", -1, "t"]}` | |
+| `extract` | `{"extract": ["dow", "t"]}` | year, quarter, month, week, day, dow, hour |
+| `case` | `{"case": [{"when": cond, "then": e}], "else": e}` | |
+| `window` | `{"window": {"fn": "avg", "of": "n", "partition": ["region"], "order": ["month"], "frame": [-2, 0]}}` | sum, avg, min, max, count, stddev, rank, dense_rank, row_number, percent_rank, cume_dist, ntile (`buckets`), lag/lead (`offset`), first_value, last_value. `frame` is `[start, end]` in rows relative to the current one; `null` is unbounded |
+| a condition | `{"column": "n", "op": "gt", "values": [10]}` | As a boolean value |
+
+**Conditions**: `{"column": expr, "op": op, "values": [literals]}`, or `"column_ref": expr` instead of `values` to compare two columns, combined with `and`, `or` and `not`. Ops: equals (several values become `IN`), not_equals, gt, gte, lt, lte, set, not_set, contains, starts_with, ends_with (case-insensitive), and `in_stage` / `not_in_stage` with `stage` and `stage_column` (a semi-join, NULLs excluded).
+
+Every name L2 emits is quoted, so stages and columns may be called `returning` or `order`. Output names must be snake_case.
 
 Typical shapes:
 
-- **Funnels and conversion:** stages per step, then `in_stage`.
-- **Cohorts:** a query stage for the first-order month per customer, joined to activity per month.
-- **Retention:** a self-join of an activity stage with an offset.
-- **Top N per group:** L1 `rank` in a query stage, then `where rank <= N`.
+- **Cohorts and retention:** the example above.
+- **Funnels and conversion:** a query stage per step, `in_stage` / `not_in_stage`, and `div` for the rates (`tests/test_stages.py`).
+- **Top N per group:** a `row_number` window partitioned by the group, then `having: rank <= N`.
+- **Rolling statistics:** `window` with a `frame`.
+- **Re-aggregation:** "average monthly revenue" is a monthly query stage, then `group` with `avg`.
+- **Crosstabs:** `pivot`.
+
+---
+
+## Governed SQL
+
+When a question doesn't fit typed queries, write SQL against cube names instead of tables:
+
+```sql
+SELECT s.region, SUM(i.revenue) AS revenue
+FROM order_items i JOIN orders o USING (order_id)
+JOIN customers c ON c.customer_id = o.customer_id JOIN states s ON s.code = c.state
+GROUP BY 1
+```
+
+`govsql.py` parses the statement and replaces every cube reference with that cube's **governed view** for the caller:
+
+- **Rows:**
+  - the tenant's schema (and tenant column) and all of its partitions;
+  - every row policy that applies to the caller, with the cubes a policy needs joined in. Those joins must be many-to-one, so no row is duplicated; otherwise the cube is refused in SQL.
+- **Columns**, under member names:
+  - the caller's visible dimensions;
+  - the per-row input of each visible sum/avg/min/max/count/count_distinct measure. `SUM(revenue)` is the governed revenue, and `COUNT(late_count)` is the filtered count;
+  - join keys only when the model declares them as dimensions, so grants apply to them too. The demo's `0006` declares `orders.customer_id` and `order_items.product_id`.
+  - Physical columns, hidden members, and the columns of joins needed only for policies are never exposed. Whole-row references (`CAST(o AS TEXT)`) see only the view.
+
+Everything else is up to the caller: CTEs, joins, windows, subqueries, `CASE`.
+
+**Refused:**
+- schema-qualified or unknown tables;
+- table functions;
+- recursive CTEs, and CTEs named like a cube;
+- anything but one SELECT;
+- functions outside the model-SQL allowlist (`pg_*`, `*_to_xml`, `dblink*`, `set_config`, file readers, unknown functions).
+
+**What's guaranteed:**
+- Results are `governed: true` but `verified: false`. Tenant, grants and row policies hold, but the layer can't check your joins for double counting the way a typed query does.
+- **Partition pruning.** A cube's view is narrowed to the partitions the statement can need when it's provably safe: a top-level `AND` term of the `WHERE` of the same SELECT that names the cube, comparing one of its dimensions with a string literal (`>=`, `>`, `<`, `<=`, `=`, `BETWEEN`). Such comparisons reject NULLs, so pruning can't change the answer, even through an outer join (`tests/test_govsql.py` checks pruned and unpruned results are equal). Qualify the column (`o.purchased_at`) when the SELECT joins several sources. Filters in an `OR`, on a CTE's columns, or in another SELECT don't prune; those reads cover every partition.
+- The statement is parsed in the warehouse's dialect.
+
+Through MCP: `data_query` with `{"sql": "…"}` instead of `query`. `mode: "sql"` returns the rewritten SQL without running it.
 
 ---
 

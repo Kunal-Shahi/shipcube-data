@@ -23,7 +23,7 @@ def run(dev, **env):
     s = local.Settings.from_env()
     first = local.seed(s)
     again = local.seed(s)  # idempotent
-    assert first["model_version"] == again["model_version"] == 5 and again["applied"] == []
+    assert first["model_version"] == again["model_version"] == 6 and again["applied"] == []
     steps = local.smoke(s, say=lambda line: None)
     assert all(st.ok for st in steps), [(st.name, st.detail) for st in steps if not st.ok]
     assert [st.name for st in steps][-1] == "agent cannot apply"

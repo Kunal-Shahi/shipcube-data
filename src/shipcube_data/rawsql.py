@@ -25,7 +25,7 @@ SYSTEM_SCHEMAS = {"information_schema", "pg_catalog", "system", "main"}
 def allowed_schemas(model: Model, ctx: SecurityContext) -> set[str]:
     out = set()
     for b in model.bindings.values():
-        if b.tenant in {"*", ctx.tenant} and not b.tenant_column:
+        if b.tenant in {"*", ctx.tenant} and not b.tenant_column and (b.isolated or b.shared):
             out.add(b.schema_.replace("{tenant}", ctx.tenant))
     return out
 

@@ -60,7 +60,7 @@ def race(opener, migrations):
 
 
 def mig(mid, op):
-    return Migration.model_validate({"id": mid, "base_version": 5, "ops": [op]})
+    return Migration.model_validate({"id": mid, "base_version": 6, "ops": [op]})
 
 
 def test_conflicting_concurrent_applies_one_wins(opener):
@@ -71,8 +71,8 @@ def test_conflicting_concurrent_applies_one_wins(opener):
     errors = [r for r in results.values() if isinstance(r, MigrationError)]
     applied = [r for r in results.values() if isinstance(r, dict)]
     assert len(applied) == 1 and len(errors) == 1
-    assert errors[0].code == "conflict" and applied[0]["version"] == 6
-    assert opener().head() == 6
+    assert errors[0].code == "conflict" and applied[0]["version"] == 7
+    assert opener().head() == 7
 
 
 def test_disjoint_concurrent_applies_both_land(opener):
@@ -80,7 +80,7 @@ def test_disjoint_concurrent_applies_both_land(opener):
         mig(f"{6 + i:04d}_m{i}", {"op": "add_measure", "name": f"orders.extra_{i}", "sql": "1"}) for i in range(4)
     ])
     assert all(isinstance(r, dict) and r["status"] == "applied" for r in results.values()), results
-    assert sorted(r["version"] for r in results.values()) == [6, 7, 8, 9]
+    assert sorted(r["version"] for r in results.values()) == [7, 8, 9, 10]
     model = opener().load()
     assert {f"extra_{i}" for i in range(4)} <= set(model.cubes["orders"].measures)
 
@@ -99,7 +99,7 @@ def test_same_migration_applied_twice_concurrently(opener):
     [t.start() for t in threads]
     [t.join(timeout=60) for t in threads]
     assert sorted(out) == ["already_applied", "applied"]
-    assert opener().head() == 6
+    assert opener().head() == 7
 
 
 def test_concurrent_proposals_get_distinct_ids(opener):

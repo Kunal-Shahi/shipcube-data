@@ -25,7 +25,7 @@ import functools
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Callable, ContextManager, Iterator, Literal, Optional
+from typing import Any, Callable, ContextManager, Iterator, Literal, Optional, Union
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -39,6 +39,7 @@ from .obs import log_event, new_query_id
 from .catalog import _loads
 from .ops import OP_ADAPTER, Migration
 from .query import Query
+from .stages import StagedQuery
 
 MAX_ROWS = 500
 PREFIX = "data_"
@@ -72,9 +73,20 @@ class DescribeArgs(_Args):
 
 
 class QueryArgs(_Args):
-    query: Query
+    query: Optional[Union[Query, StagedQuery]] = Field(
+        default=None, description="A typed query (L0/L1), or a staged query (L2: `stages` + `output`).")
+    sql: Optional[str] = Field(
+        default=None, max_length=20_000,
+        description="Governed SQL instead: one SELECT over cube names (columns are member names). Tenant, grants and "
+                    "row policies are enforced; results are labelled verified=false.")
     mode: Literal["run", "sql"] = "run"
     dialect: Optional[Literal["duckdb", "postgres", "bigquery", "clickhouse"]] = None
+
+    @model_validator(mode="after")
+    def _one(self) -> "QueryArgs":
+        if (self.query is None) == (self.sql is None):
+            raise ValueError("pass exactly one of `query` or `sql`")
+        return self
 
 
 class SearchArgs(_Args):
@@ -113,8 +125,10 @@ TOOLS = [
           "Full metadata for one cube: each member's title, description, type or aggregation, format, deprecation; "
           "joins with relationship (one_to_many joins fan out); partitioning (add a time range when present)."),
     _Tool("query", "data:read", QueryArgs,
-          "Run a typed query (measures, dimensions, time, filters, segments, calcs, order, limit). "
-          "mode=sql compiles without running. Read `warnings`: renamed or deprecated members and full scans."),
+          "Run a typed query (measures, dimensions, time, filters, segments, calcs, order, limit); a staged query "
+          "(`stages`: named L0/L1 queries, then from/join/select/where/group/having/pivot/union over earlier stages, "
+          "for cohorts, funnels, retention, top-N per group, re-aggregation); or governed `sql` over cube names "
+          "when neither fits. mode=sql compiles without running. Read `warnings`: renamed or deprecated members and full scans."),
     _Tool("search_values", "data:read", SearchArgs,
           "Distinct values of a dimension containing `text`, to get the exact spelling before filtering on it."),
     _Tool("propose_migration", "data:migrate", ProposeArgs,
@@ -249,11 +263,23 @@ class DataTools:
 
     def _query(self, a: QueryArgs, caller: Caller) -> dict[str, Any]:
         layer, ctx = self._ctx(caller)
+        if a.sql is not None:
+            if a.mode == "sql":
+                from . import govsql
+
+                safe, warnings = govsql.rewrite(a.sql, layer.catalog.load(), ctx, a.dialect or layer.dialect, layer.dialect,
+                                                layer.limits.max_rows)
+                return {"sql": safe, "dialect": a.dialect or layer.dialect, "warnings": warnings, "verified": False, "governed": True}
+            res = layer.governed_sql(a.sql, ctx)
+            rows = res["rows"]
+            res["rows"] = [{k: _jsonable(v) for k, v in r.items()} for r in rows[:MAX_ROWS]]
+            res["truncated"] = res["truncated"] or len(rows) > MAX_ROWS
+            return res
         if a.mode == "sql":
             compiled, q = layer.compile(a.query, ctx, a.dialect)
             return {"sql": compiled.sql, "dialect": compiled.dialect, "columns": [c.__dict__ for c in compiled.columns],
                     "partitions": compiled.partitions, "warnings": compiled.warnings,
-                    "model_version": q.model_version or layer.catalog.head()}
+                    "model_version": getattr(q, "model_version", None) or layer.catalog.head()}
         res = layer.query(a.query, ctx)
         rows = res["rows"]
         res["rows"] = [{k: _jsonable(v) for k, v in r.items()} for r in rows[:MAX_ROWS]]
