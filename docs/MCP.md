@@ -183,16 +183,17 @@ The metadata contract has these rules:
 
 ## `data_query`
 
-Runs a typed L0/L1 query, or compiles it without running it.
+Runs a typed L0/L1 query, a staged L2 query, or governed SQL. With `mode: "sql"` it compiles without running.
 
-**Input**
+**Input**: exactly one of `query` or `sql`.
 
 ```json
 {
   "type": "object",
-  "required": ["query"],
   "properties": {
-    "query": {"$ref": "#/$defs/Query"},
+    "query": {"anyOf": [{"$ref": "#/$defs/Query"}, {"$ref": "#/$defs/StagedQuery"}]},
+    "sql": {"type": "string", "maxLength": 20000,
+            "description": "governed SQL: one SELECT over cube names; tenant, grants and row policies are enforced"},
     "mode": {"enum": ["run", "sql"], "default": "run",
              "description": "sql: compile only and return the SQL for the warehouse dialect"},
     "dialect": {"enum": ["duckdb", "postgres", "bigquery", "clickhouse"],
@@ -202,9 +203,9 @@ Runs a typed L0/L1 query, or compiles it without running it.
 }
 ```
 
-`$defs/Query` is `Query.model_json_schema()` from `query.py`. The server publishes it as is, so it never drifts from the validator. The query shape is in [QUERY.md](QUERY.md).
+`$defs/Query` and `$defs/StagedQuery` are the Pydantic schemas from `query.py` and `stages.py`. The server publishes it as is, so it never drifts from the validator. The query shape is in [QUERY.md](QUERY.md).
 
-**Output** is the result object from [QUERY.md](QUERY.md#result): `columns`, `rows`, `sql`, `model_version`, `fingerprint`, `partitions`, `warnings`, `verified`, `cache`. The server truncates `rows` to the MCP response size budget and sets `"truncated": true`. Apps that need everything call the HTTP API.
+**Output** is the result object from [QUERY.md](QUERY.md#result): `columns`, `rows`, `sql`, `model_version`, `fingerprint`, `partitions`, `warnings`, `verified`, `level` (`L0` or `L2`), `cache`. Governed SQL returns `columns`, `rows`, `sql`, `warnings`, `verified: false` and `governed: true`; refusals use code `forbidden_sql`. The server truncates `rows` to the MCP response size budget and sets `"truncated": true`. Apps that need everything call the HTTP API.
 
 **Errors** are structured as `ToolError.to_dict()` → `{"code", "message", "hint"}`, so agents can repair a query without guessing. The codes come from `ModelError.code`:
 
