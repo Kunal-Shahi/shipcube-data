@@ -321,6 +321,63 @@ def test_compare_is_correct_across_gaps(dl, acme):
     assert by_month[2]["growth"] == pytest.approx(by_month[2]["orders__count"] / by_month[1]["orders__count"] - 1)
 
 
+def _orders(warehouse, bucket: str) -> dict:
+    rows = warehouse.execute(f"SELECT date_trunc('{bucket}', order_purchase_timestamp) b, COUNT(*) FROM ({ORDERS_ACME}) o "
+                             "GROUP BY 1 ORDER BY 1").fetchall()
+    return {b: n for b, n in rows}
+
+
+@pytest.mark.parametrize("bucket", ["week", "quarter"])
+def test_week_and_quarter_buckets_match_direct_sql(dl, acme, warehouse, bucket):
+    res = dl.query({"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": bucket}}, acme)
+    got = {r[f"orders__purchased_at__{bucket}"]: r["orders__count"] for r in res["rows"]}
+    assert got == _orders(warehouse, bucket)
+    if bucket == "week":
+        assert {b.weekday() for b in got} == {0}  # weeks start on Monday
+
+
+@pytest.mark.parametrize("bucket,offset,days", [("week", 1, 7), ("quarter", 4, 365)])
+def test_compare_steps_by_weeks_and_quarters(dl, acme, bucket, offset, days):
+    res = dl.query({"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": bucket},
+                    "calcs": [{"name": "prev", "op": "compare", "measure": "orders.count", "offset": offset, "mode": "prior"}]}, acme)
+    rows = {r[f"orders__purchased_at__{bucket}"]: r for r in res["rows"]}
+    checked = 0
+    for b, r in rows.items():
+        earlier = [p for p in rows if 0 < (b - p).days <= days + 1 and (b - p).days >= days - 2]
+        if earlier:
+            assert r["prev"] == rows[earlier[0]]["orders__count"]
+            checked += 1
+        elif r["prev"] is not None:
+            raise AssertionError(f"{b}: prev should be NULL when the period {offset} back is missing")
+    assert checked >= 3
+
+
+def test_moving_average(dl, acme):
+    res = dl.query({"measures": ["orders.count"], "dimensions": ["states.region"],
+                    "time": {"dimension": "orders.purchased_at", "granularity": "month"},
+                    "calcs": [{"name": "ma3", "op": "moving_avg", "measure": "orders.count", "by": ["states.region"]}]}, acme)
+    series: dict = {}
+    for r in res["rows"]:
+        series.setdefault(r["states__region"], []).append((r["orders__purchased_at__month"], r["orders__count"], r["ma3"]))
+    for points in series.values():
+        points.sort(key=lambda p: p[0])
+        counts = [p[1] for p in points]
+        for i, (_, _, ma) in enumerate(points):
+            if i < 2:
+                assert ma is None  # fewer than 3 periods so far
+            else:
+                assert ma == pytest.approx(sum(counts[i - 2:i + 1]) / 3)
+
+
+def test_moving_average_needs_time_and_a_sane_window(dl, acme):
+    with pytest.raises(ModelError, match="needs time with a granularity"):
+        dl.query({"measures": ["orders.count"], "dimensions": ["states.region"],
+                  "calcs": [{"name": "ma", "op": "moving_avg", "measure": "orders.count"}]}, acme)
+    with pytest.raises(Exception, match="window"):
+        dl.query({"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": "month"},
+                  "calcs": [{"name": "ma", "op": "moving_avg", "measure": "orders.count", "window": 1}]}, acme)
+
+
 def test_running_needs_additive_measure(dl, acme):
     with pytest.raises(ModelError, match="additive"):
         dl.query({"measures": ["order_items.avg_price"], "time": {"dimension": "orders.purchased_at", "granularity": "month"},
@@ -346,6 +403,25 @@ def test_compiles_to_each_dialect(dl, acme, dialect, marker):
     assert marker in compiled.sql
     sqlglot.parse_one(compiled.sql, read=dialect)  # round-trips through the dialect's parser
     assert "orders_2018_02" in compiled.sql and "orders_2017_12" not in compiled.sql
+
+
+WEEKLY = {"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": "week", "range": ["2018-01-01", "2018-03-31"]},
+          "calcs": [{"name": "ma4", "op": "moving_avg", "measure": "orders.count", "window": 4},
+                    {"name": "wow", "op": "compare", "measure": "orders.count"}]}
+
+
+@pytest.mark.parametrize("dialect,marker", [
+    ("duckdb", "DATE_TRUNC('WEEK'"),
+    ("postgres", "DATE_TRUNC('WEEK'"),
+    ("bigquery", "TIMESTAMP_TRUNC(o.order_purchase_timestamp, ISOWEEK)"),  # BigQuery's WEEK starts on Sunday
+    ("clickhouse", "dateTrunc('WEEK'"),
+])
+def test_weeks_and_moving_averages_compile_to_each_dialect(dl, acme, dialect, marker):
+    sql = dl.compile(WEEKLY, acme, dialect=dialect)[0].sql
+    assert marker.replace("o.", "orders.") in sql and "ROWS BETWEEN 3 PRECEDING AND CURRENT ROW" in sql
+    sqlglot.parse_one(sql, read=dialect)
+    quarterly = {**WEEKLY, "time": {**WEEKLY["time"], "granularity": "quarter"}}
+    sqlglot.parse_one(dl.compile(quarterly, acme, dialect=dialect)[0].sql, read=dialect)
 
 
 def test_duckdb_compile_runs(dl, acme):

@@ -200,7 +200,8 @@ class Compiler:
             return self.measure_sql(cube, member)
         e = self._expand(cube, member.sql or member.name, stack=[member.name])
         if granularity:
-            e = exp.TimestampTrunc(this=e, unit=exp.Var(this=granularity.upper()))
+            unit = "ISOWEEK" if granularity == "week" and self.dialect == "bigquery" else granularity.upper()  # Monday everywhere
+            e = exp.TimestampTrunc(this=e, unit=exp.Var(this=unit))
         return e
 
     def measure_sql(self, cube: Cube, m: Measure, stack: Optional[list[str]] = None) -> exp.Expression:
@@ -675,15 +676,17 @@ class Compiler:
                     raise ModelError(f"calc {c.name}: {d} must be one of the query's dimensions")
                 part.append(exp.column(dim_alias[d], "base"))
             val = exp.column(m.alias, "base")
-            needs_time = c.op in {"lag", "running", "compare"}
+            needs_time = c.op in {"lag", "running", "compare", "moving_avg"}
             if needs_time and not (time_ref and time_ref.granularity):
                 raise ModelError(f"calc {c.name}: {c.op} needs time with a granularity")
             t = exp.column(time_ref.alias, "base") if time_ref and time_ref.granularity else None
 
-            def win(fn: exp.Expression, order: Optional[exp.Expression] = None, desc: bool = False, frame: bool = False) -> exp.Window:
+            def win(fn: exp.Expression, order: Optional[exp.Expression] = None, desc: bool = False, frame: bool = False,
+                    preceding: Optional[int] = None) -> exp.Window:
                 spec = None
-                if frame:
-                    spec = exp.WindowSpec(kind="ROWS", start="UNBOUNDED", start_side="PRECEDING", end="CURRENT ROW")
+                if frame or preceding is not None:
+                    start = "UNBOUNDED" if preceding is None else exp.Literal.number(preceding)
+                    spec = exp.WindowSpec(kind="ROWS", start=start, start_side="PRECEDING", end="CURRENT ROW")
                 return exp.Window(
                     this=fn,
                     partition_by=[p.copy() for p in part] or None,
@@ -701,6 +704,13 @@ class Compiler:
                 if m.member.agg not in ADDITIVE_AGGS:  # type: ignore[union-attr]
                     raise ModelError(f"calc {c.name}: running totals need an additive (sum/count) measure")
                 e = win(exp.Sum(this=val.copy()), order=t, frame=True)
+            elif c.op == "moving_avg":
+                # The mean of the measure over the last `window` periods present, NULL until there are that many
+                # (like pandas rolling(window)). Gaps in the series aren't filled: a missing period isn't counted.
+                n = c.window - 1
+                avg = win(exp.Avg(this=val.copy()), order=t, preceding=n)
+                count = win(exp.Count(this=val.copy()), order=t, preceding=n)
+                e = exp.Case(ifs=[exp.If(this=exp.GTE(this=count, expression=exp.Literal.number(c.window)), true=avg)])
             else:  # compare: period-over-period through a self-join, so gaps in the series stay correct
                 p = f"p{i}"
                 shifted = self._shift(exp.column(time_ref.alias, p), c.offset, time_ref.granularity)  # type: ignore[arg-type,union-attr]
@@ -722,6 +732,8 @@ class Compiler:
 
 
 def _shift_expr(col: exp.Expression, n: int, granularity: str, dialect: str) -> exp.Expression:
+    # Weeks and quarters move as days and months: every dialect's interval arithmetic has those.
+    n, granularity = {"week": (n * 7, "day"), "quarter": (n * 3, "month")}.get(granularity, (n, granularity))
     unit = exp.Var(this=granularity.upper())
     if dialect == "bigquery":  # TIMESTAMP_ADD has no MONTH/YEAR; go through DATETIME
         return exp.cast(exp.DatetimeAdd(this=exp.cast(col, "DATETIME"), expression=exp.Literal.number(n), unit=unit), "TIMESTAMPTZ")

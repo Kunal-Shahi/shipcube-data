@@ -33,6 +33,16 @@ QUERIES = {
                            {"name": "running", "op": "running", "measure": "order_items.revenue", "by": ["states.region"]},
                            {"name": "growth", "op": "compare", "measure": "order_items.revenue", "mode": "diff"}],
                  "order": [{"member": "states.region"}, {"member": "orders.purchased_at"}]},
+    "weekly_moving_avg": {"measures": ["orders.count"],
+                          "time": {"dimension": "orders.purchased_at", "granularity": "week", "range": ["2017-12-01", "2018-03-31"]},
+                          "calcs": [{"name": "ma4", "op": "moving_avg", "measure": "orders.count", "window": 4},
+                                    {"name": "wow", "op": "compare", "measure": "orders.count", "mode": "diff"}]},
+    "quarterly_by_region": {"measures": ["order_items.revenue"], "dimensions": ["states.region"],
+                            "time": {"dimension": "orders.purchased_at", "granularity": "quarter"},
+                            "calcs": [{"name": "yoy", "op": "compare", "measure": "order_items.revenue", "offset": 4, "mode": "diff"},
+                                      {"name": "ma2", "op": "moving_avg", "measure": "order_items.revenue", "window": 2,
+                                       "by": ["states.region"]}],
+                            "order": [{"member": "states.region"}, {"member": "orders.purchased_at"}]},
 }
 CONTEXTS = {
     "acme": SecurityContext(tenant="acme", roles=["analyst"]),

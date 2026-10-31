@@ -19,7 +19,8 @@ _IDENT_RE = re.compile(IDENT)
 Agg = Literal["count", "count_distinct", "sum", "avg", "min", "max", "number"]
 DimType = Literal["string", "number", "time", "boolean"]
 Relationship = Literal["many_to_one", "one_to_many", "one_to_one"]
-Granularity = Literal["day", "month", "year"]
+Granularity = Literal["day", "month", "year"]  # partition ranges
+TimeGranularity = Literal["day", "week", "month", "quarter", "year"]  # query time buckets; weeks start on Monday
 
 FANOUT_SAFE_AGGS = {"count_distinct", "min", "max"}
 ADDITIVE_AGGS = {"count", "sum"}

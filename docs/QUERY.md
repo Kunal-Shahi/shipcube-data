@@ -33,7 +33,7 @@ No level has company-specific metric kinds. Funnels, cohorts and retention are b
 |---|---|
 | `measures` | Aggregates. Each is aggregated from its own cube (see "fan-out" below). |
 | `dimensions` | Group-by columns. Their cubes must be reachable through the model's joins. |
-| `time` | One time dimension. `granularity` (`day`, `month` or `year`) adds a truncated group-by column. `range` is an inclusive `[from, to]`: a date-only `to` covers the whole day. Without a granularity, `time` only filters. |
+| `time` | One time dimension. `granularity` (`day`, `week`, `month`, `quarter` or `year`) adds a truncated group-by column. Weeks start on Monday in every dialect; BigQuery uses `ISOWEEK`, because its `WEEK` starts on Sunday. `range` is an inclusive `[from, to]`: a date-only `to` covers the whole day. Without a granularity, `time` only filters. |
 | `filters` | A list (AND) of conditions or `{"and": […]}`, `{"or": […]}`, `{"not": …}` trees. A tree is either all dimensions (goes to `WHERE`) or all measures (goes to `HAVING`), never mixed. |
 | `segments` | Named filters from the model (`cube.segment`). A segment that reads a member hidden from the caller, or that member's column, is refused like the member itself. Segment SQL reads only its own cube's columns by plain name: no qualified columns, stars or whole-row references such as `CAST(orders AS TEXT)`. |
 | `order` | Member paths, output column names, or calc names. Default: time ascending if grouped by time, else the first measure descending. |
@@ -101,7 +101,8 @@ Suppose a group would have to walk a `one_to_many` edge, such as `orders.count` 
   {"name": "rank_in_year",  "op": "rank",    "measure": "order_items.revenue", "by": ["orders.purchased_at"]},
   {"name": "running",       "op": "running", "measure": "order_items.revenue", "by": ["states.region"]},
   {"name": "last_period",   "op": "lag",     "measure": "order_items.revenue", "by": ["states.region"], "offset": 1},
-  {"name": "growth",        "op": "compare", "measure": "orders.count", "offset": 1, "mode": "pct"}
+  {"name": "growth",        "op": "compare", "measure": "orders.count", "offset": 1, "mode": "pct"},
+  {"name": "trend",         "op": "moving_avg", "measure": "orders.count", "window": 3}
 ]
 ```
 
@@ -111,7 +112,8 @@ Suppose a group would have to walk a `one_to_many` edge, such as `orders.count` 
 | `rank` | `RANK() OVER (PARTITION BY by ORDER BY m DESC)` | |
 | `lag` | `LAG(m, offset) OVER (PARTITION BY by ORDER BY time)` | Needs `time.granularity`. Works row by row, so gaps shift it. |
 | `running` | `SUM(m) OVER (PARTITION BY by ORDER BY time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` | Refused for non-additive measures (`avg`, `count_distinct`, `number`). |
-| `compare` | Self-join of `base` on `time = prior.time + offset·granularity` and the other dimensions (null-safe). `mode`: `pct` (default), `diff` or `prior`. | Correct across gaps in the series (see below). |
+| `compare` | Self-join of `base` on `time = prior.time + offset·granularity` and the other dimensions (null-safe). `mode`: `pct` (default), `diff` or `prior`. | Correct across gaps in the series (see below). Weeks shift by 7 days and quarters by 3 months, so `offset: 4` on quarters is year over year. |
+| `moving_avg` | `AVG(m) OVER (PARTITION BY by ORDER BY time ROWS BETWEEN window-1 PRECEDING AND CURRENT ROW)`, NULL until `window` periods are present | Needs `time.granularity`. `window` is 2–366 periods, default 3, the current one included. Like `lag`, it works row by row, so a missing period isn't counted as zero. |
 
 `by` lists dimensions that are already in the query. `measure` must be one of the query's measures.
 

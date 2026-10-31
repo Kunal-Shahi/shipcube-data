@@ -164,7 +164,7 @@ class DataLayer:
             if m.kind == "measure":
                 d |= {"agg": m.agg, "additive": m.agg in {"sum", "count"}}
             else:
-                d |= {"type": m.type, "granularities": ["day", "month", "year"] if m.type == "time" else None}
+                d |= {"type": m.type, "granularities": ["day", "week", "month", "quarter", "year"] if m.type == "time" else None}
             if m.deprecated:
                 d |= {"deprecated": m.deprecated, "replaced_by": m.replaced_by}
             return {k: v for k, v in d.items() if v is not None}
