@@ -54,6 +54,36 @@
 
 Nothing was refused at 10M.
 
+## With pre-aggregations (60M orders / 100M items, production guardrails)
+
+Two rollups (`bench/scale.py --rollups`), built for every month from 2017-01 to now (118 months):
+
+| Rollup | Holds | Build | Rows | Size |
+|---|---|---|---|---|
+| `order_items.daily` | revenue, count, avg price by day × region × category × state | 725 s (≈6 s per month) | 81,048 | 9.6 MB |
+| `orders.daily` | count, late count, late rate by day × region × status | 86 s | 7,296 | 0.7 MB |
+
+| Case | Level | Answered from | Before (raised limits) | With rollups (production limits) |
+|---|---|---|---|---|
+| monthly orders + late rate, Q1 2018 | L0 | `orders.daily` | 1.3 s | 3 ms |
+| monthly orders, all time | L0 | `orders.daily` | 9.6 s | 3 ms |
+| revenue by region (4-cube join), Q1 2018 | L0 | `order_items.daily` | 40 s (refused: timeout) | 5 ms |
+| revenue by region, all time | L0 | `order_items.daily` | 68 s (refused: cost limit) | 8 ms |
+| month-over-month growth by region, 2018 | L1 | `orders.daily` | 22 s | 4 ms |
+| top-3 categories per region, Q1 2018 | L2 | `order_items.daily` (in its query stage) | 54 s (refused: timeout) | 6 ms |
+| cohort retention, H1 2018 | L2 | no rollup: per-customer grain | 106 s (refused: cost limit) | refused: cost limit |
+| governed SQL cases | SQL | no rollups for SQL yet | 0.6–30 s | unchanged |
+
+**Correctness at scale:** three routed queries were run both ways on the 100M-row data, and the answers matched exactly.
+
+| Query | Rollup | Warehouse |
+|---|---|---|
+| monthly orders and late rate, Q1 | 15 ms | 1.0 s |
+| revenue by region, Q1 | 9 ms | 36.8 s |
+| weekly revenue, avg price and count by category, Q1 | 18 ms | 6.8 s |
+
+`tests/test_rollups.py` does the same for every routing case on the demo data.
+
 ## Findings
 
 1. **The layer isn't the bottleneck.** Compiling takes 1–11 ms at every size, and the generated SQL is what you'd write by hand. Latency is the warehouse joining and aggregating.
@@ -63,13 +93,20 @@ Nothing was refused at 10M.
 4. **Some L2 questions are heavy at this scale.** Cohort retention groups 21M orders per customer: 106 s.
 5. **The default guardrails refuse those heavy queries on purpose,** with clear `cost_limit` and `query_timeout` errors and hints. That's the intended behaviour for an interactive agent. It also means production can't answer them today without pre-aggregation or an asynchronous path.
 
+6. **Pre-aggregations turn the heavy dashboard-style questions into milliseconds.** That holds for every grouped question over region, category, status and time, at any time range. It includes the three the production guardrails refused.
+7. **Building rollups costs one warehouse query per month.** That's about 6 s per month for the 4-cube `order_items` rollup at this size, so 725 s for a first build of 118 months. Two things make it slower than it needs to be:
+   - every month reads all 20 `orders` tables, because the shipping-date filter doesn't prune them (related bounds would fix that);
+   - empty months after the data ends still run.
+   Refreshing the current and previous month costs about 12 s.
+8. **Rollups don't help per-entity analyses.** Cohort retention groups by customer, so it needs the raw rows. It's still refused by the cost limit in production.
+
 ## What would make the slow cases fast
 
-Each item's effect is an estimate; none of them is built.
+Effects of the items not built yet are estimates.
 
 | What | Effect | Status |
 |---|---|---|
-| **Pre-aggregations:** materialized rollups per day × region × category, kept fresh by the model's partitions, with matching L0 queries routed to them | Revenue by region and top-N drop from tens of seconds to milliseconds | Not built (DESIGN.md "Next") |
+| **Pre-aggregations:** materialized rollups per day × region × category, kept fresh by the model's partitions, with matching L0 queries routed to them | 5–68 s → 3–8 ms on the cases above | **Built** (`rollups.py`). Refresh scheduling isn't. |
 | **Related partition bounds:** declare that `order_items.shipping_limit_at` is within N days of `orders.purchased_at`, so a filter on one prunes the other | The 4-cube Q1 join reads 4/20 order tables instead of 20/20 | Not built |
 | **Integer surrogate keys** in the warehouse instead of text ids | Faster hash joins | A data-modelling choice, outside the layer |
 | **Asynchronous long queries** (an operation id, polled) for L2 analyses that legitimately take minutes | Cohorts at 100M+ rows without raising interactive limits | Not built |

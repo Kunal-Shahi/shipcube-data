@@ -162,6 +162,36 @@ CASES = [
 CTX = SecurityContext(tenant="acme", roles=["analyst"])
 
 
+ROLLUPS = [
+    {"op": "define_rollup", "cube": "order_items", "name": "daily",
+     "measures": ["order_items.revenue", "order_items.count", "order_items.avg_price"],
+     "dimensions": ["states.region", "products.category", "customers.state"],
+     "time_dimension": "order_items.shipping_limit_at", "granularity": "day", "start": START},
+    {"op": "define_rollup", "cube": "orders", "name": "daily",
+     "measures": ["orders.count", "orders.late_count", "orders.late_rate"],
+     "dimensions": ["states.region", "orders.status"],
+     "time_dimension": "orders.purchased_at", "granularity": "day", "start": START},
+]
+
+
+def add_rollups(dl: DataLayer, url: str) -> list[dict]:
+    """Define the rollups in the model and build every month, timing each build."""
+    from shipcube_data import rollups
+
+    Runner(dl.catalog).apply(Migration.model_validate({"id": "0101_bench_rollups", "ops": ROLLUPS}))
+    out = []
+    for r in ROLLUPS:
+        t0 = time.perf_counter()
+        res = rollups.build(dl, "acme", f"{r['cube']}.{r['name']}", rollups.postgres_writer(url), schema=f"{PREFIX}rollups")
+        with psycopg.connect(url) as c:
+            size = c.execute(f"SELECT pg_size_pretty(pg_total_relation_size('{res['table']}')), count(*) FROM {res['table']}").fetchone()
+        info = {"rollup": res["rollup"], "build_s": round(time.perf_counter() - t0, 1), "months": len(res["built"]),
+                "rows": size[1], "size": size[0]}
+        print(json.dumps(info), flush=True)
+        out.append(info)
+    return out
+
+
 def partitions_read(sql: str) -> int:
     return len({f"orders_{y:04d}_{m:02d}" for y, m in demo.MONTHS if f"orders_{y:04d}_{m:02d}" in sql})
 
@@ -191,6 +221,7 @@ def run(dl: DataLayer, runs: int) -> list[dict]:
             row["first_ms"] = round(lat[0])
             row["median_ms"] = round(statistics.median(lat))
             row["rows"] = len(res["rows"])
+            row["rollup"] = res.get("rollup")
         except ModelError as e:
             row["error"] = f"{e.code}: {str(e)[:140]}"
         out.append(row)
@@ -199,13 +230,14 @@ def run(dl: DataLayer, runs: int) -> list[dict]:
 
 
 def markdown(rows: list[dict]) -> str:
-    lines = ["| Case | Level | Compile (ms) | Monthly order tables read | First run (ms) | Median (ms) | Rows |",
-             "|---|---|---|---|---|---|---|"]
+    lines = ["| Case | Level | Compile (ms) | Monthly order tables read | Rollup | First run (ms) | Median (ms) | Rows |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in rows:
         if "error" in r:
-            lines.append(f"| {r['case']} | {r['level']} | {r.get('compile_ms', '')} | {r.get('orders_partitions', '')} | refused: `{r['error']}` | | |")
+            lines.append(f"| {r['case']} | {r['level']} | {r.get('compile_ms', '')} | {r.get('orders_partitions', '')} | | refused: `{r['error']}` | | |")
         else:
-            lines.append(f"| {r['case']} | {r['level']} | {r['compile_ms']} | {r['orders_partitions']} | {r['first_ms']} | {r['median_ms']} | {r['rows']} |")
+            lines.append(f"| {r['case']} | {r['level']} | {r['compile_ms']} | {r['orders_partitions']} | {r.get('rollup') or ''} "
+                         f"| {r['first_ms']} | {r['median_ms']} | {r['rows']} |")
     return "\n".join(lines)
 
 
@@ -217,6 +249,8 @@ def main() -> None:
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--default-guards", action="store_true", help="also run with the production default QueryLimits")
     p.add_argument("--out", default=None, help="write results JSON here")
+    p.add_argument("--rollups", action="store_true", help="define and build the bench rollups, then run with them")
+    p.add_argument("--skip-plain", action="store_true", help="with --rollups: skip the runs without rollups")
     a = p.parse_args()
     info = load(a.url, a.orders) if a.load else {"orders": a.orders}
     print(json.dumps({"data": info}), flush=True)
@@ -225,9 +259,16 @@ def main() -> None:
         print("== default guardrails", flush=True)
         results["default_guards"] = run(layer(a.url, QueryLimits()), 1)
         print(markdown(results["default_guards"]))
-    print("== raised guardrails (timeout 600 s, no cost guard)", flush=True)
-    results["raised"] = run(layer(a.url, QueryLimits(timeout_s=600, max_rows=100_000, max_cost=1e15)), a.runs)
-    print(markdown(results["raised"]))
+    if not a.skip_plain:
+        print("== raised guardrails (timeout 600 s, no cost guard)", flush=True)
+        results["raised"] = run(layer(a.url, QueryLimits(timeout_s=600, max_rows=100_000, max_cost=1e15)), a.runs)
+        print(markdown(results["raised"]))
+    if a.rollups:
+        print("== with rollups, production guardrails", flush=True)
+        dl = layer(a.url, QueryLimits())
+        results["rollup_builds"] = add_rollups(dl, a.url)
+        results["rollups_default_guards"] = run(dl, a.runs)
+        print(markdown(results["rollups_default_guards"]))
     if a.out:
         Path(a.out).write_text(json.dumps(results, indent=2, default=str))
 

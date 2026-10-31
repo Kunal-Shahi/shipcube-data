@@ -19,7 +19,7 @@ from typing import Iterator
 from typing import Any, Optional
 
 from .db import Db, workspace_schema
-from .model import Cube, Dimension, Join, Measure, Model, ModelError, PartitionSpec, RowPolicy, SchemaBinding, Segment
+from .model import Cube, Dimension, Join, Measure, Model, ModelError, PartitionSpec, Rollup, RowPolicy, SchemaBinding, Segment
 
 # The catalog schema itself lives in versioned migrations: catalog_migrations/<backend>/NNNN_*.sql.
 # These are the SCD2 model tables and the key that identifies one row's current version.
@@ -32,6 +32,7 @@ CURRENT_UNIQUE = {
     "partition_specs": "cube",
     "schema_bindings": "cube, tenant",
     "row_policies": "cube, name",
+    "rollups": "cube, name",
 }
 
 
@@ -76,6 +77,8 @@ def _entities(model: Model) -> dict[tuple[str, tuple], Row]:
             }
         for s in cube.segments.values():
             out[("segments", (cube.name, s.name))] = {"cube": cube.name, "name": s.name, "sql": s.sql, "spec": _j(s.model_dump(mode="json"))}
+        for r in cube.rollups.values():
+            out[("rollups", (cube.name, r.name))] = {"cube": cube.name, "name": r.name, "spec": _j(r.model_dump(mode="json"))}
         if cube.partition:
             p = cube.partition
             out[("partition_specs", (cube.name,))] = {
@@ -218,6 +221,8 @@ class Catalog:
             model.cubes[r["cube"]].segments[r["name"]] = Segment(**_loads(r["spec"]))
         for r in rows("partition_specs"):
             model.cubes[r["cube"]].partition = PartitionSpec(**_loads(r["spec"]))
+        for r in rows("rollups"):
+            model.cubes[r["cube"]].rollups[r["name"]] = Rollup(**_loads(r["spec"]))
         for r in rows("schema_bindings"):
             b = SchemaBinding(**_loads(r["spec"]))
             model.bindings[b.key] = b
@@ -371,6 +376,20 @@ class Catalog:
 
     def audit_log(self) -> list[Row]:
         return [dict(r) for r in self.db.execute("SELECT * FROM audit_log WHERE workspace_id = ? ORDER BY id", (self.workspace_id or self.ws,))]
+
+    # ------------------------------------------------------------ rollup build state
+
+    def record_rollup_partition(self, tenant: str, cube: str, rollup: str, fingerprint: str, period: str,
+                                table_name: str, row_count: int) -> None:
+        self.db.execute(
+            "INSERT INTO rollup_partitions (workspace_id, tenant, cube, rollup, fingerprint, period, table_name, row_count, built_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (workspace_id, tenant, cube, rollup, fingerprint, period) "
+            "DO UPDATE SET table_name = excluded.table_name, row_count = excluded.row_count, built_at = excluded.built_at",
+            (self.ws, tenant, cube, rollup, fingerprint, period, table_name, row_count, _now()))
+
+    def rollup_partitions(self, tenant: str) -> list[Row]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM rollup_partitions WHERE workspace_id = ? AND tenant = ?", (self.ws, tenant))]
 
     def save_query(self, name: str, query: dict, app: Optional[str] = None, tenant: Optional[str] = None,
                    roles: list[str] | None = None, created_by: Optional[str] = None) -> None:

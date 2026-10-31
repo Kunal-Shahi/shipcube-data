@@ -124,6 +124,7 @@ class StageCompiler:
         self.warnings: list[str] = []
         self.partitions: dict[str, Any] = {}
         self.cubes: set[str] = set()
+        self.rollups: set[str] = set()
 
     # ------------------------------------------------------------ top level
 
@@ -152,12 +153,15 @@ class StageCompiler:
         cols = [Column(c, c, "stage", "unknown", humanize(c)) for c in self.info[sq.output].columns]
         return Compiled(sql=out.sql(dialect=self.dialect), dialect=self.dialect, columns=cols, cubes=sorted(self.cubes),
                         fingerprint=self.c.model.cube_fingerprint(self.cubes), partitions=self.partitions,
-                        warnings=list(dict.fromkeys(self.warnings)), expression=out)
+                        warnings=list(dict.fromkeys(self.warnings)), expression=out,
+                        rollup=",".join(sorted(self.rollups)) or None)
 
     def _stage(self, name: str, s: Stage) -> exp.Expression:
         if s.query is not None:
             compiled = self.compile_query(s.query)
             self.cubes |= set(compiled.cubes)
+            if compiled.rollup:
+                self.rollups.add(compiled.rollup)
             self.warnings += [f"{name}: {w}" for w in compiled.warnings]
             self.partitions |= {f"{name}.{k}": v for k, v in compiled.partitions.items()}
             cols = [c.name for c in compiled.columns]

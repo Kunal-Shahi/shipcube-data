@@ -105,6 +105,19 @@ class PartitionSpec(_Base):
     require_filter: bool = False
 
 
+class Rollup(_Base):
+    """A pre-aggregation of one cube: its measures by some dimensions and a time bucket, materialized in
+    the warehouse one month at a time and used for any query it can answer exactly (rollups.py)."""
+
+    name: str
+    measures: list[str]  # member paths on this cube: sum/count/min/max/avg, or number measures built from those
+    dimensions: list[str] = Field(default_factory=list)  # member paths, on this cube or cubes it joins many-to-one
+    time_dimension: str
+    granularity: Literal["day", "week", "month"] = "day"
+    start: str  # ISO date of the first month to build: the cube has no data before it
+    max_age_hours: int = 24  # a month that hadn't ended when it was built counts as stale after this
+
+
 class Cube(_Base):
     name: str
     table: Optional[str] = None
@@ -118,6 +131,7 @@ class Cube(_Base):
     segments: dict[str, Segment] = Field(default_factory=dict)
     aliases: dict[str, str] = Field(default_factory=dict)  # old member name -> current name
     partition: Optional[PartitionSpec] = None
+    rollups: dict[str, Rollup] = Field(default_factory=dict)
 
     def member(self, name: str) -> Optional[Member]:
         return self.measures.get(name) or self.dimensions.get(name)

@@ -160,7 +160,7 @@ def test_migration_role_without_create_on_the_database(tmp_path):
         with psycopg.connect(admin_url, autocommit=True) as c:
             c.execute("CREATE SCHEMA catalog")
             c.execute(f"GRANT USAGE, CREATE ON SCHEMA catalog TO {owner}")
-        assert migrate_shared_catalog(migrator_url) == ["0001_catalog.sql", "0002_ledger_read_only.sql"]
+        assert migrate_shared_catalog(migrator_url) == ["0001_catalog.sql", "0002_ledger_read_only.sql", "0003_rollups.sql"]
         assert migrate_shared_catalog(migrator_url) == []  # idempotent
         with psycopg.connect(admin_url) as c:
             owners = {r[0] for r in c.execute("SELECT tableowner FROM pg_tables WHERE schemaname = 'catalog'")}
