@@ -36,7 +36,7 @@ def two(shared_db):
 def test_workspaces_see_only_their_own_catalog(shared_db, two):
     a, b = two
     with app_session(shared_db, a) as conn:
-        assert Catalog.on_connection(conn, a).head() == 5
+        assert Catalog.on_connection(conn, a).head() == 6
     with app_session(shared_db, b) as conn:
         cat = Catalog.on_connection(conn, b)
         assert cat.head() == 0 and cat.load().cubes == {} and cat.migrations() == []
@@ -110,9 +110,9 @@ def test_tools_run_in_the_hosts_transaction(shared_db, two, tmp_path, monkeypatc
 
 def test_concurrent_appliers_in_one_workspace_serialise(shared_db, two):
     a, _ = two
-    migs = [Migration.model_validate({"id": "0006_x", "base_version": 5, "ops": [
+    migs = [Migration.model_validate({"id": "0006_x", "base_version": 6, "ops": [
                 {"op": "change_sql", "member": "order_items.revenue", "sql": "price * 1.0"}]}),
-            Migration.model_validate({"id": "0007_y", "base_version": 5, "ops": [
+            Migration.model_validate({"id": "0007_y", "base_version": 6, "ops": [
                 {"op": "rename_member", "member": "order_items.revenue", "to": "sales"}]})]
     barrier, results = threading.Barrier(2), {}
 
@@ -128,7 +128,7 @@ def test_concurrent_appliers_in_one_workspace_serialise(shared_db, two):
     threads = [threading.Thread(target=run, args=(m,)) for m in migs]
     [t.start() for t in threads]
     [t.join(timeout=60) for t in threads]
-    assert sorted(map(str, results.values())) == ["6", "conflict"]
+    assert sorted(map(str, results.values())) == ["7", "conflict"]
 
 
 def test_migration_role_without_create_on_the_database(tmp_path):

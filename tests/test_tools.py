@@ -175,7 +175,7 @@ def test_propose_approve_apply(tools, runner):
         tools.approve(mid, console(role="developer"))
     tools.approve(mid, console(role="admin"))
     applied = tools.apply(mid, ana)
-    assert applied["status"] == "applied" and applied["version"] == 6
+    assert applied["status"] == "applied" and applied["version"] == 7
 
     log = runner.catalog.audit_log()
     propose, approve, apply_ = [r for r in log if r["target_id"] == mid]

@@ -1,0 +1,8 @@
+{
+  "description": "states is reference data every tenant reads alike; join keys as dimensions, so governed SQL can join cubes",
+  "ops": [
+    {"op": "bind_schema", "cube": "states", "schema": "shared", "shared": true},
+    {"op": "add_dimension", "name": "orders.customer_id", "sql": "customer_id", "description": "The customer who placed the order (joins customers)"},
+    {"op": "add_dimension", "name": "order_items.product_id", "sql": "product_id", "description": "The product (joins products)"}
+  ]
+}

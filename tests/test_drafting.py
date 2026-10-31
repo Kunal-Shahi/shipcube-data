@@ -85,7 +85,7 @@ def test_propose_tool_drafts_then_dry_runs(tools, runner):  # noqa: F811
     assert out["explained_by"] == "muse-spark" and out["status"] == "proposed"
     assert out["summary"] == ["[additive] Add measure orders.buyers = sum(customer_id)"]  # reviewer sees the inferred agg
     assert runner.catalog.migration(out["id"])["status"] == "proposed"
-    assert runner.catalog.head() == 5  # nothing applied
+    assert runner.catalog.head() == 6  # nothing applied
 
     with pytest.raises(ToolError) as e:
         t.call("data_propose_migration", {}, agent())

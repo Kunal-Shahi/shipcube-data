@@ -97,7 +97,7 @@ def model_catalog(dialect: str, prefix: str) -> Catalog:
     if prefix:
         r.apply(Migration.model_validate({"id": "0100_route_test_run", "ops": [
             {"op": "bind_schema", "schema": f"{prefix}tenant_{{tenant}}"},
-            {"op": "bind_schema", "cube": "states", "schema": f"{prefix}shared"},
+            {"op": "bind_schema", "cube": "states", "schema": f"{prefix}shared", "shared": True},
         ]}))
     return cat
 

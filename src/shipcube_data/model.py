@@ -133,19 +133,33 @@ class SchemaBinding(_Base):
     """Routes a cube (or every cube, '*') to a warehouse schema for a tenant (or every tenant, '*').
 
     `schema` may contain `{tenant}`. `tenant_column` turns on pooled tenancy: the
-    tables are shared and rows are filtered by that column instead.
+    tables are shared and rows are filtered by that column instead. A binding for every tenant
+    with neither reads the same rows for everyone, so it must say so: `shared` (reference data).
     """
 
     cube: str = "*"
     tenant: str = "*"
     schema_: str = Field(alias="schema")
     tenant_column: Optional[str] = None
+    shared: bool = False
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     @property
     def key(self) -> str:
         return f"{self.cube}@{self.tenant}"
+
+    @property
+    def isolated(self) -> bool:
+        """Each tenant reads only its own rows: one tenant's binding, a {tenant} schema, or a tenant column."""
+        return self.tenant != "*" or "{tenant}" in self.schema_ or bool(self.tenant_column)
+
+    def check_tenancy(self) -> None:
+        if self.shared and self.isolated:
+            raise ModelError(f"binding {self.key} is tenant-isolated; `shared` is only for bindings every tenant reads alike")
+        if not self.shared and not self.isolated:
+            raise ModelError(f"binding {self.key} to schema {self.schema_!r} would give every tenant the same rows",
+                             "forbidden", "use a {tenant} schema or a tenant_column, or mark reference data `shared: true`")
 
 
 class RowPolicy(_Base):

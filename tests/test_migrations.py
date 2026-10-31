@@ -15,8 +15,8 @@ def mig(mid, *ops, base=None):
 
 def test_demo_migrations_apply_in_order(runner):
     status = runner.status(load_dir(demo.MIGRATIONS))
-    assert [s["state"] for s in status] == ["applied"] * 5
-    assert runner.catalog.head() == 5
+    assert [s["state"] for s in status] == ["applied"] * 6
+    assert runner.catalog.head() == 6
     model = runner.catalog.load()
     assert set(model.cubes) == {"customers", "states", "orders", "products", "order_items"}
 
@@ -24,7 +24,7 @@ def test_demo_migrations_apply_in_order(runner):
 def test_apply_is_idempotent(runner):
     assert runner.apply_all(load_dir(demo.MIGRATIONS)) == []
     assert runner.apply(load_dir(demo.MIGRATIONS)[0])["status"] == "already_applied"
-    assert runner.catalog.head() == 5
+    assert runner.catalog.head() == 6
 
 
 def test_editing_an_applied_migration_is_refused(runner):
@@ -92,7 +92,7 @@ def test_infer_type():
 def test_invalid_ops_are_rejected(runner, op, error):
     with pytest.raises(ModelError, match=error):
         runner.apply(mig("0100_bad", op))
-    assert runner.catalog.head() == 5
+    assert runner.catalog.head() == 6
 
 
 def test_reference_cycles_are_rejected(runner):
@@ -124,7 +124,7 @@ def test_change_sql_is_versioned_and_pinnable(runner, dl, acme):
     pinned = dl.query({"measures": ["order_items.revenue"], "model_version": 5}, acme)["rows"][0]["order_items__revenue"]
     assert after < before and pinned == before
     hist = runner.catalog.history("order_items", "revenue")
-    assert [(h["sql"], h["since_version"], h["until_version"]) for h in hist] == [("price", 2, 6), ("price - freight_value", 6, None)]
+    assert [(h["sql"], h["since_version"], h["until_version"]) for h in hist] == [("price", 2, 7), ("price - freight_value", 7, None)]
 
 
 def _cities(dl, ctx, **pin):
@@ -193,12 +193,12 @@ def test_rollback_restores_previous_model_exactly(runner):
                      {"op": "add_segment", "name": "orders.late", "sql": "{is_late}"}))
     assert runner.catalog.load().fingerprint() != fp
     report = runner.rollback(actor="test")
-    assert report["status"] == "rolled_back" and report["to_version"] == 5
+    assert report["status"] == "rolled_back" and report["to_version"] == 6
     assert runner.catalog.load().fingerprint() == fp
     assert runner.catalog.migration("0006_a")["status"] == "rolled_back"
     # versions are never reused
     runner.apply(mig("0007_b", {"op": "set_meta", "target": "orders", "description": "One row per order"}))
-    assert runner.catalog.head() == 7
+    assert runner.catalog.head() == 8
 
 
 def test_conflicting_migrations_are_detected(runner):
@@ -236,7 +236,7 @@ def test_dry_run_reports_breaking_saved_queries(runner):
     assert [w["query"] for w in report["impact"]["warnings"]] == ["orders_by_month"]  # rename: still works, but warns
     assert report["impact"]["unaffected"] == 0
     assert "joins:order_items.products" in report["diff"]["removed"]
-    assert cat.head() == 5  # dry run wrote nothing
+    assert cat.head() == 6  # dry run wrote nothing
     with pytest.raises(MigrationError, match="would break saved queries: revenue_by_category"):
         runner.apply(mig("0006_drop", {"op": "drop_join", "cube": "order_items", "to": "products"}), allow_breaking=False)
 
@@ -245,14 +245,14 @@ def test_agent_proposal_needs_a_different_human_to_approve(runner):
     rep = runner.propose([{"op": "add_measure", "name": "order_items.min_price", "sql": "price"}],
                          "Add min price", proposed_by="agent:claude")
     mid = rep["id"]
-    assert mid == "0006_add_min_price" and rep["status"] == "proposed" and rep["kind"] == "additive"
+    assert mid == "0007_add_min_price" and rep["status"] == "proposed" and rep["kind"] == "additive"
     with pytest.raises(MigrationError, match="needs human approval"):
         runner.apply(runner.stored(mid), actor="agent:claude", require_approval=True)
     with pytest.raises(MigrationError, match="other than the person who proposed it"):
         runner.approve(mid, "agent:claude")
     runner.approve(mid, "kunal")
     out = runner.apply(runner.stored(mid), actor="agent:claude", require_approval=True)
-    assert out["status"] == "applied" and out["version"] == 6
+    assert out["status"] == "applied" and out["version"] == 7
     log = runner.catalog.audit_log()
     assert [a["action"] for a in log[-3:]] == ["data.migration.propose", "data.migration.approve", "data.migration.apply"]
     assert log[-1]["target_id"] == mid and log[-1]["actor_type"] == "system"

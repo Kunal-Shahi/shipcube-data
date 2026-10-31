@@ -108,7 +108,7 @@ def layer(url: str, limits: QueryLimits) -> DataLayer:
     r.apply_all(load_dir(demo.MIGRATIONS))
     r.apply(Migration.model_validate({"id": "0100_route_bench", "ops": [
         {"op": "bind_schema", "schema": f"{PREFIX}tenant_{{tenant}}"},
-        {"op": "bind_schema", "cube": "states", "schema": SHARED},
+        {"op": "bind_schema", "cube": "states", "schema": SHARED, "shared": True},
     ]}))
     return DataLayer(cat, PostgresWarehouse(url, application_name="shipcube-bench"), limits=limits)
 

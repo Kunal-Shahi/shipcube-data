@@ -535,14 +535,20 @@ class BindSchema(_Op):
     cube: str = "*"
     tenant: str = "*"
     tenant_column: Optional[str] = None
+    shared: bool = False  # reference data every tenant reads alike; required when the binding isn't tenant-isolated
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     def apply(self, model: Model, dialect: str) -> None:
         if self.cube != "*":
             model.cube(self.cube)
-        binding = SchemaBinding(cube=self.cube, tenant=self.tenant, schema=self.schema_, tenant_column=self.tenant_column)
+        binding = SchemaBinding(cube=self.cube, tenant=self.tenant, schema=self.schema_, tenant_column=self.tenant_column,
+                                shared=self.shared)
         if "{tenant}" in self.schema_ and self.tenant != "*":
             raise ModelError("a {tenant} schema template only makes sense with tenant '*'")
+        if binding.shared and binding.isolated:
+            binding.check_tenancy()
+        # An unmarked shared binding is allowed here (migration history has them) but refused by every query
+        # that reads it (Compiler.schema_for), until it's re-bound tenant-isolated or `shared: true`.
         model.bindings[binding.key] = binding  # rebinding replaces
 
     def touches(self, model: Model) -> set[str]:

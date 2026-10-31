@@ -299,7 +299,8 @@ A row policy is a **typed filter tree**, the same language as query filters. Val
 | Where to declare it | A policy restricts rows of *its* cube. Declare it on the fact cube you want restricted. A policy on `customers` doesn't affect a query that never touches `customers`. |
 | No SQL injection | Values are bound from the `SecurityContext` and rendered as SQL literals by sqlglot, never spliced in as text. `test_ctx_values_are_literals_not_sql` covers this. |
 | Fail closed | A missing `$ctx` key is an error. An empty list in the context matches nothing. |
-| Governed SQL | Each cube becomes a subquery with the caller's policies (and the many-to-one joins they need) applied. |
+| Governed SQL | Each cube becomes a subquery with the caller's policies (and the many-to-one joins they need) applied. Only visible members are columns; join keys only as declared dimensions. |
+| Shared bindings | A binding every tenant reads alike must be marked `shared: true`; an unmarked one is refused by every query. |
 | Raw SQL (L3) | Refused while any policy applies to the caller. |
 
 Member grants (`grant_member`) complement row policies. Policies hide rows; grants hide columns and metrics.

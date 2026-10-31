@@ -8,9 +8,10 @@ Every reference to a cube becomes a subquery that is the governed view of that c
 
 * its rows: the tenant's schema (and tenant column), every row policy that applies to the caller
   (joining the cubes a policy needs, many-to-one only, so rows aren't duplicated), all partitions;
-* its columns: the caller's visible dimensions under their member names, the row-level input of each
-  visible sum/avg/min/max/count/count_distinct measure (so `SUM(revenue)` is the governed revenue), and
-  the key columns of the model's joins (unless a hidden member reads them), so cubes join as the model does.
+* its columns: the caller's visible dimensions under their member names, and the row-level input of
+  each visible sum/avg/min/max/count/count_distinct measure (so `SUM(revenue)` is the governed revenue).
+  Join keys are columns only when the model declares them as dimensions (so grants apply to them too);
+  physical columns never are.
   Physical columns, hidden members and the columns of policy-only joins are never exposed.
 
 Anything else in the statement may be any read-only SQL the warehouse supports: CTEs, joins, windows,
@@ -163,14 +164,6 @@ def governed_view(comp: Compiler, cube: Cube, bounds: Bounds | None = None) -> e
             cols.append(e.as_(m.name))
     if not cols:
         raise ModelError(f"unknown table {cube.name!r}: governed SQL reads cubes", "forbidden_sql")
-    # The key columns of the model's own joins, so cubes can be joined in SQL the way the model joins them.
-    hidden = comp.hidden_columns(cube)
-    for edge in comp._edges(cube.name):
-        for c in parse_expr(edge.on, comp.src).find_all(exp.Column):
-            key = c.name.lower()
-            if c.table == cube.name and key not in names and key not in hidden:
-                names.add(key)
-                cols.append(exp.column(c.name, cube.name).as_(key))
 
     # Row policies may need other cubes (a region on states for orders): join them, to a fixed point,
     # and apply their own policies too, exactly as a typed query would.

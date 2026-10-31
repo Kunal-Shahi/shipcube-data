@@ -214,7 +214,7 @@ GROUP BY 1
 - **Columns**, under member names:
   - the caller's visible dimensions;
   - the per-row input of each visible sum/avg/min/max/count/count_distinct measure. `SUM(revenue)` is the governed revenue, and `COUNT(late_count)` is the filtered count;
-  - the key columns of the model's joins, unless a hidden member reads them.
+  - join keys only when the model declares them as dimensions, so grants apply to them too. The demo's `0006` declares `orders.customer_id` and `order_items.product_id`.
   - Physical columns, hidden members, and the columns of joins needed only for policies are never exposed. Whole-row references (`CAST(o AS TEXT)`) see only the view.
 
 Everything else is up to the caller: CTEs, joins, windows, subqueries, `CASE`.

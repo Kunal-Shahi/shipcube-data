@@ -81,7 +81,7 @@ class FakeStore:
 
 def test_warehouse_status(api):
     w = api("GET", "/warehouse", "agent").json()
-    assert w["connected"] and w["kind"] == "duckdb" and w["model_version"] == 5
+    assert w["connected"] and w["kind"] == "duckdb" and w["model_version"] == 6
     assert {"label": "Status", "value": "reachable"} in w["details"] and "olist.duckdb" in str(w["details"])
 
 
@@ -118,8 +118,8 @@ def propose(api, ops, description="Proposal"):
 
 def test_migration_review_and_person_only_apply(api):
     listed = api("GET", "/migrations", "bob-dev").json()
-    assert {m["status"] for m in listed} == {"applied"} and len(listed) == 5
-    assert listed[-1]["applied"]["version"] in range(1, 6)
+    assert {m["status"] for m in listed} == {"applied"} and len(listed) == 6
+    assert listed[-1]["applied"]["version"] in range(1, 7)
 
     mid = propose(api, [{"op": "add_measure", "name": "orders.buyers", "sql": "customer_id", "agg": "count_distinct"}], "Buyers")
     m = api("GET", f"/migrations/{mid}", "bob-dev").json()
@@ -133,8 +133,8 @@ def test_migration_review_and_person_only_apply(api):
     r = api("POST", f"/migrations/{mid}:apply", "bob-dev")  # a new measure can expose data: admin only
     assert r.status_code == 403 and "admin" in r.json()["error"]["message"]
     done = api("POST", f"/migrations/{mid}:apply", "carl-admin").json()
-    assert done["status"] == "applied" and done["applied"]["version"] == 6
-    assert api("GET", "/warehouse", "bob-dev").json()["model_version"] == 6
+    assert done["status"] == "applied" and done["applied"]["version"] == 7
+    assert api("GET", "/warehouse", "bob-dev").json()["model_version"] == 7
     assert api("POST", f"/migrations/{mid}:apply", "carl-admin").status_code == 409
     assert api("POST", f"/migrations/{mid}:launch", "carl-admin").status_code in (404, 405)
 

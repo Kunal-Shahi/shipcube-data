@@ -4,6 +4,7 @@ import pytest
 import sqlglot
 
 from shipcube_data.compiler import SecurityContext
+from shipcube_data.ops import Migration
 from shipcube_data.model import ModelError
 from shipcube_data.warehouses import WarehouseError
 
@@ -146,3 +147,49 @@ def test_pruning_reads_fewer_partitions_and_never_changes_answers(dl, acme, monk
     full = dl.governed_sql(sql, acme)
     assert len(re.findall(r"orders_\d{4}_\d{2}", full["sql"])) >= len(reads)
     assert pruned["rows"] == full["rows"]
+
+
+# ---------------------------------------------------------------- red-team D-1 / D-2
+
+def test_join_keys_are_columns_only_as_declared_dimensions_with_their_grants(runner, dl, acme):
+    """D-1: a join key is readable only when the model declares it as a dimension, and its grants apply."""
+    sql = "SELECT count(*) AS n FROM orders o JOIN customers c ON c.customer_id = o.customer_id"
+    assert rows(dl, sql, acme)[0]["n"] == 1500
+    runner.apply(Migration.model_validate({"id": "0007_hide_key", "ops": [
+        {"op": "grant_member", "member": "orders.customer_id", "roles": ["finance"]}]}))
+    with pytest.raises(WarehouseError):  # hidden from analysts: no column, raw or otherwise
+        dl.governed_sql(sql, acme)
+    assert rows(dl, sql, SecurityContext(tenant="acme", roles=["finance"]))[0]["n"] == 1500
+
+
+def test_unmarked_shared_bindings_fail_closed(runner, dl, acme):
+    """D-2: a binding every tenant reads alike must be marked `shared`, or nothing reads it."""
+    runner.apply(Migration.model_validate({"id": "0007_unmark", "ops": [
+        {"op": "bind_schema", "cube": "states", "schema": "shared"}]}))
+    for run in (lambda: dl.query({"measures": ["states.count"]}, acme),
+                lambda: dl.governed_sql("SELECT count(*) FROM states", acme)):
+        with pytest.raises(ModelError, match="same rows"):
+            run()
+    with pytest.raises(ModelError, match="not readable"):  # raw SQL doesn't see the schema either
+        dl.raw_sql("SELECT count(*) FROM shared.states", acme)
+    assert dl.query({"measures": ["orders.count"]}, acme)["rows"][0]["orders__count"] == 1500  # other cubes unaffected
+    runner.apply(Migration.model_validate({"id": "0008_mark", "ops": [
+        {"op": "bind_schema", "cube": "states", "schema": "shared", "shared": True}]}))
+    assert dl.query({"measures": ["states.count"]}, acme)["rows"][0]["states__count"] == 27
+
+
+@pytest.mark.parametrize("op,match", [
+    ({"op": "bind_schema", "schema": "tenant_{tenant}", "shared": True}, "only for bindings every tenant reads alike"),
+    ({"op": "bind_schema", "cube": "orders", "schema": "pooled", "tenant_column": "tenant_id", "shared": True}, "only for bindings"),
+])
+def test_shared_is_only_for_untenanted_bindings(runner, op, match):
+    from shipcube_data.migrate import MigrationError
+
+    with pytest.raises((ModelError, MigrationError), match=match):
+        runner.apply(Migration.model_validate({"id": "0007_bad", "ops": [op]}))
+
+
+def test_one_tenants_own_binding_needs_no_flag(runner, dl, acme):
+    runner.apply(Migration.model_validate({"id": "0007_acme_only", "ops": [
+        {"op": "bind_schema", "cube": "states", "tenant": "acme", "schema": "shared"}]}))
+    assert dl.query({"measures": ["states.count"]}, acme)["rows"][0]["states__count"] == 27

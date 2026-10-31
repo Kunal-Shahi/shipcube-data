@@ -292,6 +292,7 @@ class Compiler:
         )
         if binding is None:
             raise ModelError(f"no schema binding for cube {cube.name} and tenant {tenant}", "forbidden")
+        binding.check_tenancy()  # fail closed on bindings from before `shared` existed
         return binding.schema_.replace("{tenant}", tenant), binding.tenant_column
 
     def source(self, cube: Cube, bounds: Bounds) -> tuple[exp.Expression, list[exp.Expression]]:
