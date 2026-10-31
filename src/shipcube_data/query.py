@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .model import Granularity
+from .model import TimeGranularity
 
 Scalar = Union[str, int, float, bool]
 
@@ -85,7 +85,7 @@ def filter_members(f: Filter) -> list[str]:
 
 class TimeSpec(_Base):
     dimension: str
-    granularity: Optional[Granularity] = None
+    granularity: Optional[TimeGranularity] = None
     range: Optional[tuple[str, str]] = None  # inclusive ISO dates or datetimes
 
 
@@ -98,10 +98,11 @@ class Calc(_Base):
     """L1 operator, compiled to a window function (or a period self-join for compare)."""
 
     name: str
-    op: Literal["share", "rank", "lag", "running", "compare"]
+    op: Literal["share", "rank", "lag", "running", "compare", "moving_avg"]
     measure: str
     by: list[str] = Field(default_factory=list)  # dimensions to partition by
     offset: int = 1  # lag / compare: periods back
+    window: int = Field(default=3, ge=2, le=366)  # moving_avg: periods, the current one included
     mode: Literal["pct", "diff", "prior"] = "pct"  # compare only
 
 
