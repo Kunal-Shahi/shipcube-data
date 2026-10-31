@@ -8,6 +8,7 @@ Related docs:
 
 - [MIGRATIONS.md](MIGRATIONS.md): the migration vocabulary, which is the core of the design.
 - [QUERY.md](QUERY.md): the query language, levels L0 to L3.
+- [BENCHMARK.md](BENCHMARK.md): compile time, latency and partition pruning at 10M and 100M rows on Postgres.
 - [MCP.md](MCP.md): the tools coding agents use.
 - [RUNBOOK.md](RUNBOOK.md): configuring, deploying and operating the service.
 

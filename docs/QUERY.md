@@ -228,7 +228,7 @@ Everything else is up to the caller: CTEs, joins, windows, subqueries, `CASE`.
 
 **What's guaranteed:**
 - Results are `governed: true` but `verified: false`. Tenant, grants and row policies hold, but the layer can't check your joins for double counting the way a typed query does.
-- Partitions aren't pruned yet: a governed view reads every partition. Add filters for speed; the warehouse still scans everything.
+- **Partition pruning.** A cube's view is narrowed to the partitions the statement can need when it's provably safe: a top-level `AND` term of the `WHERE` of the same SELECT that names the cube, comparing one of its dimensions with a string literal (`>=`, `>`, `<`, `<=`, `=`, `BETWEEN`). Such comparisons reject NULLs, so pruning can't change the answer, even through an outer join (`tests/test_govsql.py` checks pruned and unpruned results are equal). Qualify the column (`o.purchased_at`) when the SELECT joins several sources. Filters in an `OR`, on a CTE's columns, or in another SELECT don't prune; those reads cover every partition.
 - The statement is parsed in the warehouse's dialect.
 
 Through MCP: `data_query` with `{"sql": "…"}` instead of `query`. `mode: "sql"` returns the rewritten SQL without running it.

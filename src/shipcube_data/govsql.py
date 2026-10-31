@@ -21,12 +21,15 @@ Results are labelled `verified: false` (the layer can't prove arbitrary joins do
 
 from __future__ import annotations
 
+import re
+from datetime import date, timedelta
+
 from sqlglot import exp
 
 from .compiler import Compiler, SecurityContext
-from .model import Cube, Measure, Model, ModelError
+from .model import Cube, Dimension, Measure, Model, ModelError
 from .partitions import Bounds
-from .query import filter_members
+from .query import Condition, filter_members
 from .rawsql import FORBIDDEN
 from .sqlutil import forbidden_function, parse_expr, parse_query
 
@@ -53,7 +56,8 @@ def rewrite(sql: str, model: Model, ctx: SecurityContext, dialect: str, source_d
         raise ModelError(f"a CTE may not be named like a cube: {sorted(clash)}", "forbidden_sql")
 
     comp = Compiler(model, ctx, dialect, source_dialect)
-    views: dict[str, exp.Select] = {}
+    pushed = _pushdown_conditions(tree, model, ctes)
+    views: dict[tuple[str, str], exp.Select] = {}
     warnings: list[str] = []
     for t in list(tree.find_all(exp.Table)):
         if not isinstance(t.this, exp.Identifier):
@@ -67,16 +71,81 @@ def rewrite(sql: str, model: Model, ctx: SecurityContext, dialect: str, source_d
         if name not in model.cubes:
             raise ModelError(f"unknown table {t.name!r}: governed SQL reads cubes", "forbidden_sql",
                              f"cubes: {', '.join(sorted(model.cubes))}")
-        if name not in views:
-            views[name] = governed_view(comp, model.cube(name))
+        cube = model.cube(name)
+        bounds = comp._bounds(cube, pushed.get(id(t), []), None)
+        key = (name, repr(bounds))
+        if key not in views:
+            views[key] = governed_view(comp, cube, bounds)
         alias = t.alias or t.name
-        t.replace(exp.Subquery(this=views[name].copy(), alias=exp.TableAlias(this=exp.to_identifier(alias))))
+        t.replace(exp.Subquery(this=views[key].copy(), alias=exp.TableAlias(this=exp.to_identifier(alias))))
     warnings += comp.warnings
     wrapped = exp.select("*").from_(exp.Subquery(this=tree, alias=exp.TableAlias(this=exp.to_identifier("governed")))).limit(limit)
     return wrapped.sql(dialect=dialect), list(dict.fromkeys(warnings))
 
 
-def governed_view(comp: Compiler, cube: Cube) -> exp.Select:
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_FLIP = {exp.GT: "lt", exp.GTE: "lte", exp.LT: "gt", exp.LTE: "gte", exp.EQ: "equals"}
+_OPS = {exp.GT: "gt", exp.GTE: "gte", exp.LT: "lt", exp.LTE: "lte", exp.EQ: "equals"}
+
+
+def _pushdown_conditions(tree: exp.Expression, model: Model, ctes: set[str]) -> dict[int, list[Condition]]:
+    """Partition bounds each cube reference may be read with: {id(Table node): [conditions]}.
+
+    Only what's provably safe to apply early: a top-level AND term of the WHERE of the same SELECT that
+    names the cube in its FROM/JOIN, comparing one of that cube's dimensions with a literal (>, >=, <, <=,
+    =, BETWEEN). Those comparisons reject NULLs, so rows they'd drop never reach the result, even through
+    an outer join. A column is matched to a cube by its qualifier, or unqualified when the SELECT reads
+    exactly one source. Everything else (OR, subqueries, CTE columns) is just not pruned. The compiler's
+    own `_bounds` turns the conditions into partitions, as it does for typed queries."""
+    out: dict[int, list[Condition]] = {}
+    for sel in tree.find_all(exp.Select):
+        where = sel.args.get("where")
+        frm = sel.args.get("from_") or sel.args.get("from")  # the key differs across sqlglot versions
+        sources = [frm.this] if frm else []
+        sources += [j.this for j in sel.args.get("joins") or []]
+        if where is None or not sources:
+            continue
+        by_alias: dict[str, exp.Table] = {}
+        for s in sources:
+            if isinstance(s, exp.Table) and s.name.lower() in model.cubes and s.name.lower() not in ctes and not s.args.get("db"):
+                by_alias[(s.alias or s.name).lower()] = s
+        if not by_alias:
+            continue
+        only = next(iter(by_alias.values())) if len(sources) == 1 else None
+        for term in where.this.flatten() if isinstance(where.this, exp.And) else [where.this]:
+            for col, op, value in _comparisons(term):
+                table = by_alias.get(col.table.lower()) if col.table else only
+                if table is None:
+                    continue
+                cube = model.cube(table.name.lower())
+                if not isinstance(cube.member(col.name), Dimension):
+                    continue
+                if op == "lt" and _DATE_ONLY.match(value):  # strictly before midnight: the day before, inclusive
+                    op, value = "lte", (date.fromisoformat(value) - timedelta(days=1)).isoformat()
+                out.setdefault(id(table), []).append(Condition(member=f"{cube.name}.{col.name}", op=op, values=[value]))
+    return out
+
+
+def _comparisons(term: exp.Expression) -> list[tuple[exp.Column, str, str]]:
+    def literal(e: exp.Expression) -> str | None:
+        while isinstance(e, (exp.Cast, exp.Paren)):
+            e = e.this
+        return e.this if isinstance(e, exp.Literal) and e.is_string else None
+
+    if isinstance(term, exp.Between) and isinstance(term.this, exp.Column):
+        lo, hi = literal(term.args["low"]), literal(term.args["high"])
+        return [(term.this, "gte", lo), (term.this, "lte", hi)] if lo and hi else []
+    for cls, op in _OPS.items():
+        if type(term) is cls:
+            a, b = term.this, term.expression
+            if isinstance(a, exp.Column) and (v := literal(b)):
+                return [(a, op, v)]
+            if isinstance(b, exp.Column) and (v := literal(a)):
+                return [(b, _FLIP[cls], v)]
+    return []
+
+
+def governed_view(comp: Compiler, cube: Cube, bounds: Bounds | None = None) -> exp.Select:
     """SELECT <visible members> FROM <cube's tenant source, plus many-to-one joins for its policies> WHERE <policies>."""
     cols = []
     names: set[str] = set()
@@ -120,7 +189,7 @@ def governed_view(comp: Compiler, cube: Cube) -> exp.Select:
         raise ModelError(f"a row policy on {cube.name} needs {fan[0].dst} through a {fan[0].relationship} join, which would "
                          "duplicate rows; use a typed query (L0-L2) for this cube", "forbidden_sql")
     where: list[exp.Expression] = []
-    src, preds = comp.source(cube, Bounds())
+    src, preds = comp.source(cube, bounds or Bounds())
     sel = exp.select(*cols).from_(src)
     where += preds
     for e in tree:

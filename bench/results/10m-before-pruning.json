@@ -1,0 +1,211 @@
+{
+  "data": {
+    "orders": 10000000,
+    "order_items": 16667212,
+    "customers": 2500000,
+    "size": "2409 MB",
+    "load_s": 31.0
+  },
+  "default_guards": [
+    {
+      "case": "monthly orders + late rate, Q1 2018",
+      "level": "L0",
+      "compile_ms": 1.3,
+      "orders_partitions": "3/20",
+      "first_ms": 181,
+      "median_ms": 181,
+      "rows": 3
+    },
+    {
+      "case": "monthly orders, all time",
+      "level": "L0",
+      "compile_ms": 2.5,
+      "orders_partitions": "20/20",
+      "first_ms": 962,
+      "median_ms": 962,
+      "rows": 20
+    },
+    {
+      "case": "revenue by region (4-cube join), Q1 2018",
+      "level": "L0",
+      "compile_ms": 3.9,
+      "orders_partitions": "20/20",
+      "first_ms": 3231,
+      "median_ms": 3231,
+      "rows": 4
+    },
+    {
+      "case": "revenue by region, all time",
+      "level": "L0",
+      "compile_ms": 3.4,
+      "orders_partitions": "20/20",
+      "first_ms": 10012,
+      "median_ms": 10012,
+      "rows": 4
+    },
+    {
+      "case": "MoM growth by region (L1 compare), 2018",
+      "level": "L1",
+      "compile_ms": 2.4,
+      "orders_partitions": "8/20",
+      "first_ms": 1810,
+      "median_ms": 1810,
+      "rows": 32
+    },
+    {
+      "case": "cohort retention, H1 2018",
+      "level": "L2",
+      "compile_ms": 2.5,
+      "orders_partitions": "6/20",
+      "first_ms": 10941,
+      "median_ms": 10941,
+      "rows": 21
+    },
+    {
+      "case": "top-3 categories per region, Q1 2018",
+      "level": "L2",
+      "compile_ms": 5.8,
+      "orders_partitions": "20/20",
+      "first_ms": 5938,
+      "median_ms": 5938,
+      "rows": 12
+    },
+    {
+      "case": "status counts, all time",
+      "level": "SQL",
+      "compile_ms": 3.3,
+      "orders_partitions": "20/20",
+      "first_ms": 672,
+      "median_ms": 672,
+      "rows": 3
+    },
+    {
+      "case": "status counts, Q1 2018",
+      "level": "SQL",
+      "compile_ms": 3.3,
+      "orders_partitions": "20/20",
+      "first_ms": 307,
+      "median_ms": 307,
+      "rows": 3
+    },
+    {
+      "case": "revenue by region (joins), Q1 2018",
+      "level": "SQL",
+      "compile_ms": 4.6,
+      "orders_partitions": "20/20",
+      "first_ms": 2165,
+      "median_ms": 2165,
+      "rows": 4
+    },
+    {
+      "case": "3-month rolling orders, 2018",
+      "level": "SQL",
+      "compile_ms": 3.7,
+      "orders_partitions": "20/20",
+      "first_ms": 522,
+      "median_ms": 522,
+      "rows": 8
+    }
+  ],
+  "raised": [
+    {
+      "case": "monthly orders + late rate, Q1 2018",
+      "level": "L0",
+      "compile_ms": 1.2,
+      "orders_partitions": "3/20",
+      "first_ms": 179,
+      "median_ms": 163,
+      "rows": 3
+    },
+    {
+      "case": "monthly orders, all time",
+      "level": "L0",
+      "compile_ms": 2.5,
+      "orders_partitions": "20/20",
+      "first_ms": 955,
+      "median_ms": 938,
+      "rows": 20
+    },
+    {
+      "case": "revenue by region (4-cube join), Q1 2018",
+      "level": "L0",
+      "compile_ms": 3.9,
+      "orders_partitions": "20/20",
+      "first_ms": 2837,
+      "median_ms": 3239,
+      "rows": 4
+    },
+    {
+      "case": "revenue by region, all time",
+      "level": "L0",
+      "compile_ms": 3.3,
+      "orders_partitions": "20/20",
+      "first_ms": 9817,
+      "median_ms": 9789,
+      "rows": 4
+    },
+    {
+      "case": "MoM growth by region (L1 compare), 2018",
+      "level": "L1",
+      "compile_ms": 2.4,
+      "orders_partitions": "8/20",
+      "first_ms": 1586,
+      "median_ms": 1640,
+      "rows": 32
+    },
+    {
+      "case": "cohort retention, H1 2018",
+      "level": "L2",
+      "compile_ms": 2.5,
+      "orders_partitions": "6/20",
+      "first_ms": 10333,
+      "median_ms": 10511,
+      "rows": 21
+    },
+    {
+      "case": "top-3 categories per region, Q1 2018",
+      "level": "L2",
+      "compile_ms": 5.2,
+      "orders_partitions": "20/20",
+      "first_ms": 5366,
+      "median_ms": 5110,
+      "rows": 12
+    },
+    {
+      "case": "status counts, all time",
+      "level": "SQL",
+      "compile_ms": 3.3,
+      "orders_partitions": "20/20",
+      "first_ms": 635,
+      "median_ms": 632,
+      "rows": 3
+    },
+    {
+      "case": "status counts, Q1 2018",
+      "level": "SQL",
+      "compile_ms": 3.3,
+      "orders_partitions": "20/20",
+      "first_ms": 321,
+      "median_ms": 309,
+      "rows": 3
+    },
+    {
+      "case": "revenue by region (joins), Q1 2018",
+      "level": "SQL",
+      "compile_ms": 4.6,
+      "orders_partitions": "20/20",
+      "first_ms": 1713,
+      "median_ms": 1707,
+      "rows": 4
+    },
+    {
+      "case": "3-month rolling orders, 2018",
+      "level": "SQL",
+      "compile_ms": 3.7,
+      "orders_partitions": "20/20",
+      "first_ms": 490,
+      "median_ms": 484,
+      "rows": 8
+    }
+  ]
+}

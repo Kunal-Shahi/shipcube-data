@@ -109,3 +109,40 @@ def test_rewrites_for_each_dialect(dl, acme, dialect):
                              dialect, dl.dialect, 100)
     sqlglot.parse_one(safe, read=dialect)
     assert "tenant_acme.orders_2018_01" in safe.replace("`", "").replace('"', "")
+
+
+# ---------------------------------------------------------------- partition pruning
+
+PRUNING_CASES = [
+    ("SELECT status, count(*) AS n FROM orders WHERE purchased_at >= '2018-01-01' AND purchased_at < '2018-04-01' "
+     "GROUP BY status ORDER BY status", 3),
+    ("SELECT count(*) AS n FROM orders o WHERE o.purchased_at BETWEEN '2018-02-01' AND '2018-02-20'", 1),
+    ("SELECT count(*) AS n FROM orders WHERE '2018-06-01' <= purchased_at", 3),
+    ("SELECT count(*) AS n FROM orders WHERE purchased_at = '2017-07-04'", 1),
+    ("SELECT count(*) AS n FROM order_items i JOIN orders o USING (order_id) "
+     "WHERE i.shipping_limit_at >= '2018-06-01' AND o.purchased_at >= '2018-05-01'", 4),
+    # outer joins: a null-rejecting WHERE term on the nullable side gives the same rows pruned or not
+    ("SELECT count(*) AS n, count(o.order_id) AS matched FROM order_items i LEFT JOIN orders o ON o.order_id = i.order_id "
+     "WHERE o.purchased_at >= '2018-08-01'", 1),
+    ("SELECT count(*) AS n FROM orders o RIGHT JOIN order_items i ON o.order_id = i.order_id WHERE o.purchased_at < '2017-03-01'", 2),
+    # not pruned (and still correct): OR, a CTE column, an unqualified column across a join, a subquery scope
+    ("SELECT count(*) AS n FROM orders WHERE purchased_at >= '2018-01-01' OR status = 'canceled'", 20),
+    ("WITH x AS (SELECT * FROM orders) SELECT count(*) AS n FROM x WHERE purchased_at >= '2018-05-01'", 20),
+    ("SELECT count(*) AS n FROM order_items i LEFT JOIN orders o USING (order_id) WHERE purchased_at >= '2018-05-01'", 20),
+    ("SELECT count(*) AS n FROM orders WHERE order_id IN (SELECT order_id FROM orders WHERE purchased_at >= '2018-08-01')", 1 + 20),
+]
+
+
+@pytest.mark.parametrize("sql,tables", PRUNING_CASES)
+def test_pruning_reads_fewer_partitions_and_never_changes_answers(dl, acme, monkeypatch, sql, tables):
+    import re
+
+    from shipcube_data import govsql
+
+    pruned = dl.governed_sql(sql, acme)
+    reads = re.findall(r"orders_\d{4}_\d{2}", pruned["sql"])
+    assert len(reads) == tables  # one entry per monthly table read, across every cube reference
+    monkeypatch.setattr(govsql, "_pushdown_conditions", lambda *a, **k: {})
+    full = dl.governed_sql(sql, acme)
+    assert len(re.findall(r"orders_\d{4}_\d{2}", full["sql"])) >= len(reads)
+    assert pruned["rows"] == full["rows"]
