@@ -116,6 +116,8 @@ You can still keep migrations in Git, as the demo's `examples/olist/migrations/*
 | `catalog.py` | SCD2 persistence by diffing two models. Model loading at any version. |
 | `migrate.py` | Status, dry-run with impact analysis, apply, rollback, propose and approve. |
 | `query.py`, `compiler.py`, `partitions.py` | Typed queries in, SQL out. |
+| `stages.py` | L2: compiles staged queries; query stages go through the compiler. |
+| `govsql.py` | Governed SQL: rewrites cube references into per-caller governed views. |
 | `rawsql.py` | The L3 validator. |
 | `engine.py` | The facade the MCP tools call: `list_cubes`, `describe_cube`, `query`, `search_values`, `raw_sql`. Also the result cache, query ids and query logs. |
 | `warehouses.py`, `datasources.py` | DuckDB, Cloud SQL Postgres and BigQuery adapters with guardrails; datasources registered from secret references. |
@@ -296,6 +298,7 @@ A row policy is a **typed filter tree**, the same language as query filters. Val
 | Where to declare it | A policy restricts rows of *its* cube. Declare it on the fact cube you want restricted. A policy on `customers` doesn't affect a query that never touches `customers`. |
 | No SQL injection | Values are bound from the `SecurityContext` and rendered as SQL literals by sqlglot, never spliced in as text. `test_ctx_values_are_literals_not_sql` covers this. |
 | Fail closed | A missing `$ctx` key is an error. An empty list in the context matches nothing. |
+| Governed SQL | Each cube becomes a subquery with the caller's policies (and the many-to-one joins they need) applied. |
 | Raw SQL (L3) | Refused while any policy applies to the caller. |
 
 Member grants (`grant_member`) complement row policies. Policies hide rows; grants hide columns and metrics.
@@ -395,14 +398,15 @@ sha256(
 | 18 ops (see [MIGRATIONS.md](MIGRATIONS.md)) | Built |
 | L0 compiler: routing, pruning (table, column and list), RLS, grants, fan-out, multi-fact stitching | Built |
 | L1 operators: `share`, `rank`, `lag`, `running`, `compare` | Built |
-| L2 stages | Designed in [QUERY.md](QUERY.md), not built |
+| L2 stages | Built (`stages.py`): joins, derived columns, any window, re-aggregation, pivots, set operations, semi-joins |
+| Governed SQL | Built (`govsql.py`): SELECTs over cube names, rewritten into governed views per caller |
 | L3 validator | Built (DuckDB-focused deny-list) |
 | In-process MCP library (`tools.py`, five `data_` tools plus console-only approve, apply and register_datasource) and identity mapping from the security schema (`identity.py`) | Built |
 | Migration drafting: real Muse Spark (`muse-spark-1.3`) when `META_API_KEY` is set, rule fallback otherwise (logged) | Built; live-tested |
 | Datasource registration from secret references; DuckDB, Postgres and BigQuery connectors | Built |
 | Installable package (`pip install git+…`, examples bundled in the wheel) | Built |
 | Dialects | DuckDB, Postgres and BigQuery are executed in tests. ClickHouse compiles and parses back, but has no adapter or live test yet. |
-| Next | L1 operators extended and L2 stages (stages are specified in [QUERY.md](QUERY.md)); freshness tokens; pre-aggregations; BigQuery wildcard rendering; a ClickHouse adapter |
+| Next | Partition pruning inside governed SQL; freshness tokens; pre-aggregations; BigQuery wildcard rendering; a ClickHouse adapter |
 
 Known limits:
 

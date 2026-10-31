@@ -60,6 +60,25 @@ def test_query_through_the_tool(tools):
     assert sql["dialect"] == "bigquery" and "tenant_acme" in sql["sql"]
 
 
+def test_staged_queries_and_governed_sql_through_the_tool(tools):
+    staged = {"stages": {"m": {"query": {"measures": ["orders.count"], "time": {"dimension": "orders.purchased_at", "granularity": "quarter"}}},
+                         "t": {"from": "m", "group": {"agg": {"avg_per_quarter": {"fn": "avg", "of": "orders.count"}}}}},
+              "output": "t"}
+    out = tools.call("query", {"query": staged}, agent())
+    assert out["level"] == "L2" and out["verified"] and out["rows"][0]["avg_per_quarter"] > 0
+    json.dumps(out)
+    out = tools.call("query", {"sql": "SELECT status, count(*) AS n FROM orders GROUP BY status"}, agent())
+    assert out["governed"] and out["verified"] is False and sum(r["n"] for r in out["rows"]) == 1500
+    compiled = tools.call("query", {"sql": "SELECT count(*) FROM orders", "mode": "sql", "dialect": "bigquery"}, agent())
+    assert compiled["dialect"] == "bigquery" and "tenant_acme.orders_2018_08" in compiled["sql"]
+    with pytest.raises(ToolError) as e:
+        tools.call("query", {"query": {"measures": ["orders.count"]}, "sql": "SELECT 1"}, agent())
+    assert e.value.code == "invalid_arguments"
+    with pytest.raises(ToolError) as e:
+        tools.call("query", {"sql": "SELECT * FROM tenant_globex.orders_2018_01"}, agent())
+    assert e.value.code == "forbidden_sql"
+
+
 def test_tenant_comes_from_identity(tools):
     acme = tools.call("query", {"query": {"measures": ["orders.count"]}}, agent())["rows"][0]["orders__count"]
     globex = tools.call("query", {"query": {"measures": ["orders.count"]}}, agent(email="gil@globex.test"))["rows"][0]["orders__count"]
