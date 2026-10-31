@@ -68,6 +68,7 @@ class Compiled:
     partitions: dict[str, dict[str, Any]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     expression: Optional[exp.Expression] = None
+    rollup: Optional[str] = None  # cube.rollup when the query was answered from a pre-aggregation
 
 
 @dataclass
@@ -100,7 +101,10 @@ def output_alias(path: str, granularity: Optional[str] = None) -> str:
 
 
 class Compiler:
-    def __init__(self, model: Model, ctx: SecurityContext, dialect: str = "duckdb", source_dialect: str = "duckdb"):
+    def __init__(self, model: Model, ctx: SecurityContext, dialect: str = "duckdb", source_dialect: str = "duckdb",
+                 system: bool = False, rollups: Optional[list] = None):
+        """`system`: every member visible and no row policies. Only rollup builds use it, never a caller's query.
+        `rollups`: built pre-aggregations this query may be answered from (rollups.available)."""
         if dialect not in DIALECTS:
             raise ModelError(f"unsupported dialect {dialect!r}; pick one of {', '.join(DIALECTS)}")
         if not _IDENT_RE.match(ctx.tenant):
@@ -108,12 +112,18 @@ class Compiler:
         self.model, self.ctx, self.dialect, self.src = model, ctx, dialect, source_dialect
         self.warnings: list[str] = []
         self.partitions: dict[str, dict[str, Any]] = {}
+        self.system, self.rollups = system, rollups or []
+        self.col_override: dict[tuple, exp.Expression] = {}  # (cube, member, granularity) -> expression (rollup columns)
+        self.measure_override: dict[tuple, exp.Expression] = {}  # (cube, measure) -> re-aggregation
+        self.rollup_used: Optional[str] = None
 
     # ------------------------------------------------------------ resolution & access
 
     def visible(self, cube: Cube, member: Member, _seen: Optional[set[str]] = None) -> bool:
         """A member is visible if the caller holds one of its grants (or the cube's), and
         so is everything it references: {revenue} + {freight} must not leak freight."""
+        if self.system:
+            return True
         grants = member.grants or cube.grants
         if grants and not set(grants) & set(self.ctx.roles):
             return False
@@ -167,6 +177,8 @@ class Compiler:
         return f"did you mean {', '.join(near)}?" if near else None
 
     def policies_for(self, cube: str) -> list[Filter]:
+        if self.system:
+            return []
         out = []
         roles = set(self.ctx.roles)
         for p in self.model.policies.values():
@@ -198,6 +210,8 @@ class Compiler:
     def member_sql(self, cube: Cube, member: Member, granularity: Optional[str] = None) -> exp.Expression:
         if isinstance(member, Measure):
             return self.measure_sql(cube, member)
+        if (cube.name, member.name, granularity) in self.col_override:
+            return self.col_override[(cube.name, member.name, granularity)].copy()
         e = self._expand(cube, member.sql or member.name, stack=[member.name])
         if granularity:
             unit = "ISOWEEK" if granularity == "week" and self.dialect == "bigquery" else granularity.upper()  # Monday everywhere
@@ -205,6 +219,8 @@ class Compiler:
         return e
 
     def measure_sql(self, cube: Cube, m: Measure, stack: Optional[list[str]] = None) -> exp.Expression:
+        if (cube.name, m.name) in self.measure_override:
+            return self.measure_override[(cube.name, m.name)].copy()
         stack = (stack or []) + [m.name]
         if m.agg == "number":
             return self._expand(cube, m.sql or "", stack=stack, measures=True)
@@ -471,23 +487,30 @@ class Compiler:
                 raise ModelError(f"unknown or not permitted: segment {s}", "unknown_member")
             segments.append((cube, cube.segments[name]))
 
-        groups: dict[str, list[_Ref]] = {}
-        for r in measures:
-            groups.setdefault(r.cube.name, []).append(r)
-        if not groups:
-            groups[(dims[0].cube.name if dims else time_ref.cube.name)] = []  # type: ignore[union-attr]
+        from .rollups import route
 
-        used: set[str] = set()
-        selects: list[tuple[str, exp.Select]] = []
-        for root, ms in groups.items():
-            sel, cubes = self._group(root, ms, dims, dim_filters, segments, measure_filters if len(groups) == 1 else [], q, time_ref)
-            used |= cubes
-            selects.append((root, sel))
-
-        if len(selects) == 1:
-            body = selects[0][1]
+        routed = route(self, q, dims, measures, dim_filters, measure_filters, segments, time_ref, self.rollups) if self.rollups else None
+        if routed is not None:
+            body, used, self.rollup_used = routed
+            self.partitions = {"rollup": {"name": self.rollup_used}}
         else:
-            body = self._stitch(selects, dims, measures, measure_filters)
+            groups: dict[str, list[_Ref]] = {}
+            for r in measures:
+                groups.setdefault(r.cube.name, []).append(r)
+            if not groups:
+                groups[(dims[0].cube.name if dims else time_ref.cube.name)] = []  # type: ignore[union-attr]
+
+            used = set()
+            selects: list[tuple[str, exp.Select]] = []
+            for root, ms in groups.items():
+                sel, cubes = self._group(root, ms, dims, dim_filters, segments, measure_filters if len(groups) == 1 else [], q, time_ref)
+                used |= cubes
+                selects.append((root, sel))
+
+            if len(selects) == 1:
+                body = selects[0][1]
+            else:
+                body = self._stitch(selects, dims, measures, measure_filters)
 
         columns = [
             Column(r.alias, r.path, "dimension", getattr(r.member, "type", "string"), r.member.title or humanize(r.member.name), r.granularity)
@@ -531,6 +554,7 @@ class Compiler:
             partitions=self.partitions,
             warnings=list(dict.fromkeys(self.warnings)),
             expression=body,
+            rollup=self.rollup_used,
         )
 
     def _default_order(self, dims: list[_Ref], measures: list[_Ref], time_ref: Optional[_Ref]):

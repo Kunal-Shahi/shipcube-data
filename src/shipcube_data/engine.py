@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import time
 from collections import OrderedDict
@@ -105,6 +106,7 @@ class DataLayer:
         self.limits = limits or QueryLimits.from_env()
         self.metrics = metrics or NoMetrics()
         self.runner = Runner(catalog)
+        self.rollup_schema = os.environ.get("SHIPCUBE_DATA_ROLLUP_SCHEMA", "shipcube_rollups")
 
     @classmethod
     def from_catalog(cls, catalog: Catalog, resolve_secret=None, connectors=None, datasource: str = "primary", **kwargs) -> "DataLayer":
@@ -205,7 +207,8 @@ class DataLayer:
         if q.model_version is not None and q.model_version != self.catalog.head():
             kept = self.access_changes_since(model, q.model_version)
             model = pin_definitions(model, self._model(q.model_version), kept)
-        compiled = Compiler(model, ctx, dialect or self.dialect, self.dialect).compile(q, as_stage=as_stage)
+        compiled = Compiler(model, ctx, dialect or self.dialect, self.dialect,
+                            rollups=self._rollups(model, ctx, dialect)).compile(q, as_stage=as_stage)
         used = set()
         for col in compiled.columns:
             if col.kind != "calc":
@@ -214,6 +217,14 @@ class DataLayer:
         compiled.warnings += [f"{c}.{m} uses the current definition: it changed after model_version {q.model_version}"
                               for c, m in sorted(kept & used)]
         return compiled, q
+
+    def _rollups(self, model: Model, ctx: SecurityContext, dialect: Optional[str]) -> list:
+        """Built rollups this tenant's queries may use. A rollup lives in one warehouse, so only for its dialect."""
+        if (dialect and dialect != self.dialect) or not any(c.rollups for c in model.cubes.values()):
+            return []
+        from . import rollups
+
+        return rollups.available(model, self.catalog.rollup_partitions(ctx.tenant), self.dialect, ctx.tenant)
 
     def access_changes_since(self, head: Model, version: int) -> frozenset[tuple[str, str]]:
         """Members (by their current names) a pin to `version` must not restore:
@@ -299,6 +310,7 @@ class DataLayer:
             "warnings": warnings,
             "verified": True,
             "level": fields["query_level"],
+            "rollup": compiled.rollup,
             "cache": "hit" if hit else "miss",
             "stats": {"elapsed_ms": elapsed, **stats},
         }

@@ -198,6 +198,26 @@ Re-defining a partition replaces the spec.
 
 ---
 
+### 2.6 Pre-aggregations
+
+| Op | Required | Optional | Kind |
+|---|---|---|---|
+| `define_rollup` | `cube`, `name`, `measures`, `time_dimension`, `start` | `dimensions`, `granularity` (day/week/month, default day), `max_age_hours` (24) | additive |
+| `drop_rollup` | `rollup` (`cube.rollup`) | | additive |
+
+**What a rollup can hold:**
+- **Measures:** the cube's sum, count, min and max measures; avg (stored as a sum and a count); and number measures built only from those. `count_distinct` and measures that aggregate in their own SQL are refused: they can't be re-aggregated.
+- **Dimensions:** on the cube, or on cubes it joins many-to-one, by their current names.
+- **Start:** the first month there's data for. Months are built from there to now.
+
+Neither op changes an answer: a query is answered from a rollup only when the rollup gives exactly the warehouse's result (QUERY.md, "Pre-aggregations").
+
+**Renames and drops:**
+- Renaming a member updates the rollups that use it.
+- Dropping a member a rollup uses is refused, like one a segment uses.
+
+**Data and definitions:** building writes data, not model, so it isn't a migration: `shipcube-data rollup-build`. A change to any definition the rollup reads changes its fingerprint. The months already built then stop being used until they're rebuilt.
+
 ## 3. Inference rules
 
 Inference runs when the op is applied, and its result is **stored**. A later change to these rules never changes an existing model. To override an inference, set the field explicitly.

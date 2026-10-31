@@ -276,7 +276,7 @@ def test_mcp_schemas_generate():
     from shipcube_data.query import Query
 
     op_schema = OP_ADAPTER.json_schema()
-    assert set(op_schema["discriminator"]["mapping"]) == set(OP_NAMES) and len(OP_NAMES) == 18
+    assert set(op_schema["discriminator"]["mapping"]) == set(OP_NAMES) and len(OP_NAMES) == 20
     assert "measures" in Query.model_json_schema()["properties"]
 
 
@@ -287,11 +287,11 @@ def test_catalog_schema_migrations_are_versioned(tmp_path):
     with pytest.raises(ModelError) as e:
         Catalog(url, migrate=False)
     assert e.value.code == "catalog_not_migrated"
-    assert Db(url).migrate_schema() == ["0001_initial.sql", "0002_migration_humans.sql", "0003_migration_decisions.sql", "0004_workspace_column.sql"]
+    assert Db(url).migrate_schema() == ["0001_initial.sql", "0002_migration_humans.sql", "0003_migration_decisions.sql", "0004_workspace_column.sql", "0005_rollups.sql"]
     assert Db(url).migrate_schema() == []  # idempotent
     cat = Catalog(url, migrate=False)
     assert [r["name"] for r in cat.db.execute("SELECT name FROM catalog_schema_migrations ORDER BY version")] == [
-        "0001_initial.sql", "0002_migration_humans.sql", "0003_migration_decisions.sql", "0004_workspace_column.sql"]
+        "0001_initial.sql", "0002_migration_humans.sql", "0003_migration_decisions.sql", "0004_workspace_column.sql", "0005_rollups.sql"]
     cat.db.execute("UPDATE catalog_schema_migrations SET checksum = 'edited'")
     with pytest.raises(ModelError, match="changed after it was applied"):
         Db(url).migrate_schema()

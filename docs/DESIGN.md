@@ -301,6 +301,7 @@ A row policy is a **typed filter tree**, the same language as query filters. Val
 | Fail closed | A missing `$ctx` key is an error. An empty list in the context matches nothing. |
 | Governed SQL | Each cube becomes a subquery with the caller's policies (and the many-to-one joins they need) applied. Only visible members are columns; join keys only as declared dimensions. |
 | Shared bindings | A binding every tenant reads alike must be marked `shared: true`; an unmarked one is refused by every query. |
+| Pre-aggregations | Built without policies (complete tenant data, in a per-tenant table); every policy that applies to the caller is applied to the rollup's rows, or the query isn't routed. |
 | Raw SQL (L3) | Refused while any policy applies to the caller. |
 
 Member grants (`grant_member`) complement row policies. Policies hide rows; grants hide columns and metrics.
@@ -401,14 +402,15 @@ sha256(
 | L0 compiler: routing, pruning (table, column and list), RLS, grants, fan-out, multi-fact stitching | Built |
 | L1 operators: `share`, `rank`, `lag`, `running`, `compare` | Built |
 | L2 stages | Built (`stages.py`): joins, derived columns, any window, re-aggregation, pivots, set operations, semi-joins |
-| Governed SQL | Built (`govsql.py`): SELECTs over cube names, rewritten into governed views per caller |
+| Governed SQL | Built (`govsql.py`): SELECTs over cube names, rewritten into governed views per caller, with partition pruning |
+| Pre-aggregations | Built (`rollups.py`): declared with `define_rollup`, built per month by `rollup-build`, routed only when exact; policies applied to the rollup's rows |
 | L3 validator | Built (DuckDB-focused deny-list) |
 | In-process MCP library (`tools.py`, five `data_` tools plus console-only approve, apply and register_datasource) and identity mapping from the security schema (`identity.py`) | Built |
 | Migration drafting: real Muse Spark (`muse-spark-1.3`) when `META_API_KEY` is set, rule fallback otherwise (logged) | Built; live-tested |
 | Datasource registration from secret references; DuckDB, Postgres and BigQuery connectors | Built |
 | Installable package (`pip install git+…`, examples bundled in the wheel) | Built |
 | Dialects | DuckDB, Postgres and BigQuery are executed in tests. ClickHouse compiles and parses back, but has no adapter or live test yet. |
-| Next | Partition pruning inside governed SQL; freshness tokens; pre-aggregations; BigQuery wildcard rendering; a ClickHouse adapter |
+| Next | Scheduled rollup refresh in the worker; rollups for governed SQL; freshness tokens; BigQuery wildcard rendering; a ClickHouse adapter |
 
 Known limits:
 

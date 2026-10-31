@@ -253,6 +253,31 @@ A deny-list is weaker than an allow-list. A production version should allow-list
 
 ---
 
+## Pre-aggregations
+
+A rollup (`define_rollup`, MIGRATIONS.md §2.6) is one cube's measures by some dimensions and a time bucket. It's materialized in the warehouse and used automatically for any typed query it can answer exactly, including query stages in L2 (`rollups.py`).
+
+**Building.** `shipcube-data rollup-build --rollup cube.name --tenant t --writer-url …` builds or rebuilds months; with no `--period`, every month from the rollup's `start` to now.
+- **How a month is built:** the regular compiler compiles it as an L0 query in system mode (every member, no row policies), so the rollup holds the tenant's complete data.
+- **Where it goes:** `<SHIPCUBE_DATA_ROLLUP_SCHEMA>.<cube>__<rollup>__<hash of tenant and fingerprint>`, replacing that month's rows in one transaction.
+- **Connection:** the build uses a separate writer connection; the query adapter never writes.
+- **Record:** the catalog records each month built (`rollup_partitions`), per tenant and model fingerprint.
+- **Refreshing:** rebuild the current and previous months on a schedule.
+
+**Routing.** When a typed query is compiled, it's answered from the first (coarsest) built rollup that satisfies all of these. Otherwise it goes to the warehouse.
+
+- **Measures:** all on the rollup's cube, and re-aggregatable from its parts. Sums and counts are summed again, min and max are taken again, avg is sum/count, and number measures are recomputed from their parts.
+- **Dimensions:** in the rollup. The time bucket is the rollup's time dimension, at its grain or coarser: a daily rollup serves day, week, month, quarter and year; a monthly one, month, quarter and year.
+- **Filters:**
+  - on the rollup's dimensions;
+  - on its time dimension, only as date-only `in_date_range`, `after_date`/`gte` or `before_date`/`lt`, aligned to its grain (any day for a daily rollup, the 1st for a monthly one).
+  - `having` filters must be on measures it can re-aggregate.
+- **Row policies:** every policy the warehouse query would apply must filter on the rollup's dimensions. It's then applied to the rollup's rows. Grants are checked before routing, like any query.
+- **Coverage:** every month the query can touch is built from the current definitions and is fresh: built after the month ended, or within `max_age_hours`.
+- **Not routed:** segments, pinned `model_version` and multi-cube measures always go to the warehouse.
+
+Results say which rollup answered them: `"rollup": "order_items.daily"`. `tests/test_rollups.py` runs each routed query both ways and checks the answers are identical.
+
 ## Compilation and dialects
 
 All SQL is built as sqlglot expressions and never by string concatenation. Member and segment SQL is parsed in the catalog's `dialect` setting. The output is rendered with `expression.sql(dialect=…)`:

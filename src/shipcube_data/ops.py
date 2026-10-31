@@ -30,6 +30,7 @@ from .model import (
     ModelError,
     PartitionSpec,
     Relationship,
+    Rollup,
     RowPolicy,
     SchemaBinding,
     Segment,
@@ -110,6 +111,10 @@ def dependents(cube: Cube, name: str, model: Model) -> list[str]:
     for p in model.policies.values():
         if f"{cube.name}.{name}" in filter_members(parse_filter(p.filter)):
             out.append(f"policy {p.key}")
+    for c in model.cubes.values():
+        for r in c.rollups.values():
+            if f"{cube.name}.{name}" in [*r.measures, *r.dimensions, r.time_dimension]:
+                out.append(f"rollup {c.name}.{r.name}")
     return out
 
 
@@ -345,6 +350,12 @@ def _rewrite_refs(model: Model, cube: Cube, old: str, new: str) -> None:
             m.filter = sub(m.filter)
     for s in cube.segments.values():
         s.sql = sub(s.sql) or s.sql
+    path, renamed = f"{cube.name}.{old}", f"{cube.name}.{new}"
+    for c in model.cubes.values():
+        for r in c.rollups.values():
+            r.measures = [renamed if p == path else p for p in r.measures]
+            r.dimensions = [renamed if p == path else p for p in r.dimensions]
+            r.time_dimension = renamed if r.time_dimension == path else r.time_dimension
     for p in model.policies.values():
         p.filter = json.loads(json.dumps(p.filter).replace(f'"{cube.name}.{old}"', f'"{cube.name}.{new}"'))
 
@@ -679,12 +690,60 @@ class DropRowPolicy(_Op):
         return {f"policy:{self.policy}"}
 
 
+class DefineRollup(_Op):
+    """Declare a pre-aggregation. It changes no answers: queries it can answer exactly are routed to it
+    once its months are built (`shipcube-data rollup-build`), with the caller's grants and policies applied."""
+
+    op: Literal["define_rollup"]
+    cube: str
+    name: str
+    measures: list[str] = Field(min_length=1)
+    dimensions: list[str] = Field(default_factory=list)
+    time_dimension: str
+    granularity: Literal["day", "week", "month"] = "day"
+    start: str
+    max_age_hours: int = Field(default=24, ge=1, le=24 * 366)
+    kind: Kind = "additive"
+
+    def apply(self, model: Model, dialect: str) -> None:
+        from .rollups import validate_rollup
+
+        cube = model.cube(self.cube)
+        check_ident(self.name, "rollup name")
+        if self.name in cube.rollups:
+            raise ModelError(f"rollup {self.cube}.{self.name} already exists")
+        r = Rollup(name=self.name, measures=self.measures, dimensions=self.dimensions, time_dimension=self.time_dimension,
+                   granularity=self.granularity, start=self.start, max_age_hours=self.max_age_hours)
+        validate_rollup(model, cube, r, dialect)
+        cube.rollups[self.name] = r
+
+    def touches(self, model: Model) -> set[str]:
+        return {f"rollup:{self.cube}.{self.name}"}
+
+
+class DropRollup(_Op):
+    op: Literal["drop_rollup"]
+    rollup: str  # cube.rollup
+    kind: Kind = "additive"
+
+    def apply(self, model: Model, dialect: str) -> None:
+        cube_name, name = _split(self.rollup, "rollup")
+        cube = model.cube(cube_name)
+        if name not in cube.rollups:
+            raise ModelError(f"unknown rollup {self.rollup}")
+        del cube.rollups[name]
+
+    def touches(self, model: Model) -> set[str]:
+        return {f"rollup:{self.rollup}"}
+
+
 OP_TYPES = (
     CreateCube, DropCube,
     AddMeasure, AddDimension, RenameMember, DeprecateMember, ChangeSql, DropMember, SetMeta,
     AddJoin, DropJoin, AddSegment,
     BindSchema, DefinePartition,
     GrantMember, RevokeMember, AddRowPolicy, DropRowPolicy,
+    DefineRollup, DropRollup,
 )
 Op = Annotated[Union[OP_TYPES], Field(discriminator="op")]  # type: ignore[valid-type]
 OP_ADAPTER: TypeAdapter[Op] = TypeAdapter(Op)
