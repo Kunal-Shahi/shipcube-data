@@ -6,6 +6,12 @@ You define base cubes, measures, dimensions and joins through versioned **model 
 
 Part of [ShipCube](https://github.com/Kunal-Shahi/shipcube).
 
+## Built
+
+- **When:** built from scratch for the Meta AI Developer Hackathon. The first commit was on **2026-10-27**; the work in this repo runs from **2026-10-27 to 2026-11-01**, and the git history has the details. Nothing here predates the hackathon.
+- **How:** a clean-room implementation, designed from public sources only: the Cube, dbt MetricFlow, Malloy and LookML docs, and sqlglot.
+- **What you need to run it:** nothing private and no cloud account. Everything below runs on generated demo data in DuckDB, or Postgres if you prefer. BigQuery and Cloud SQL are optional production warehouses, and their integration tests skip without credentials. To see the agent tools answer on the demo data in a minute, see [docs/LOCAL.md §5](docs/LOCAL.md#5-without-docker-no-cloud-account-needed).
+
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md) covers goals, how this compares to Cube, MetricFlow, Malloy and LookML, the catalog schema, query resolution (schema routing, partition pruning, row-level security) and caching by fingerprint.
@@ -130,4 +136,4 @@ The demo data is **synthetic**. It is generated deterministically with the table
 
 ## License
 
-Apache-2.0
+Apache-2.0: see [LICENSE](LICENSE).

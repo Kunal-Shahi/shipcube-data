@@ -16,10 +16,16 @@ The demo data is synthetic and generated deterministically. It uses the public O
 
 ## 1. Compose
 
-[`deploy/local/compose.data.yaml`](../deploy/local/compose.data.yaml) holds the service definitions to merge into the stack:
+ShipCube's `deploy/local/compose.yaml` runs the data layer as described here. [`deploy/local/compose.data.yaml`](../deploy/local/compose.data.yaml) is the older standalone example, with a separate catalog database, kept for running this package next to any Postgres.
 
-- **`data-seed`**: a one-shot job, run with the MCP image, that executes `shipcube-data seed`. It is idempotent. It creates `shipcube_data` and `warehouse` if they are missing, migrates the catalog schema, loads the warehouse, registers it as the workspace's datasource, applies the model migrations, maps demo Google domains to tenants, and registers two saved queries for impact analysis.
-- **`mcp`**: gets the same environment, plus the DuckDB volume read-only. It starts after `data-seed` completes.
+- **Catalog schema:** the stack's `migrate` step creates it, as on Cloud SQL. It runs `python -m shipcube_api.admin migrate --extra data` as the migration role, which applies the API's schema and then shipcube-data's shared catalog (schema `catalog` in the `shipcube` database, FORCE RLS).
+- **`data-seed`:** a one-shot job, run with the API image by `make up`, that executes `shipcube-data seed`. It's idempotent. It:
+  - loads the demo warehouse;
+  - registers it as the seeded workspace's datasource;
+  - applies the model migrations in `examples/olist/migrations` (0001–0006);
+  - maps demo Google domains to tenants;
+  - registers two saved queries for impact analysis.
+- **`api`:** serves both the `/v1/data` routes and the MCP `data_*` tools (the MCP server runs in the same process). It reads the DuckDB volume read-only.
 
 The seed is safe to re-run while the stack is up: an existing DuckDB file is kept (use `--force` to rebuild it), and applied migrations are skipped.
 
@@ -28,41 +34,32 @@ The seed is safe to re-run while the stack is up: an existing DuckDB file is kep
 | Variable | Local value | Meaning |
 |---|---|---|
 | `SHIPCUBE_DEV_MODE` | `1` | Allows the DuckDB warehouse and `projects/local` secrets. Never set in production. |
-| `SHIPCUBE_DATA_CATALOG_URL` | `postgresql://postgres:postgres@postgres:5432/shipcube_data` | Catalog database |
+| `SHIPCUBE_DATA_CATALOG_LAYOUT` | `shared` | The catalog is ShipCube's own database, schema `catalog`, with row-level security per workspace |
+| `SHIPCUBE_DATA_CATALOG_URL` | `postgresql://postgres:…@db:5432/shipcube` (`data-seed` only) | Where `seed` writes the seeded workspace's catalog rows. The API needs no URL: each request runs in its own `db.tx(caller)` |
 | `SHIPCUBE_DATA_WORKSPACE` | the workspace id the local bootstrap creates | The workspace whose catalog is seeded. Callers in other workspaces get `catalog_not_migrated`. |
 | `SHIPCUBE_DATA_WAREHOUSE` | `duckdb` (default) or `postgres` | Which demo warehouse to load and register |
 | `SHIPCUBE_DATA_DUCKDB_PATH` | `/data/olist.duckdb` | DuckDB file, on a volume shared read-only with the MCP server |
-| `SHIPCUBE_DATA_WAREHOUSE_URL` | `postgresql://postgres:postgres@postgres:5432/warehouse?sslmode=disable` | Postgres warehouse. It is served to the data layer as the local secret `projects/local/secrets/ws-<workspace>-warehouse`. |
-| `SHIPCUBE_DATA_ALLOWED_DB_HOSTS` | `postgres` | The stack's Postgres is a private host. Database hosts that resolve to private addresses are refused unless they are listed here. |
-| `SHIPCUBE_DATA_DEMO_TENANTS` | `example.com=acme,globex.test=globex` | Google domain → demo tenant. A caller whose email domain isn't listed gets the workspace tenant, which has no demo data. |
+| `SHIPCUBE_DATA_WAREHOUSE_URL` | `postgresql://postgres:…@db:5432/warehouse?sslmode=disable` | Postgres warehouse. It is served to the data layer as the local secret `projects/local/secrets/ws-<workspace>-warehouse`. |
+| `SHIPCUBE_DATA_ALLOWED_DB_HOSTS` | `db` | The stack's Postgres is a private host. Database hosts that resolve to private addresses are refused unless they are listed here. |
+| `SHIPCUBE_DATA_DEMO_TENANTS` | `shipcube.local=acme,example.com=acme,globex.test=globex` | Google domain → demo tenant. The stack's seeded user is `@shipcube.local`. A caller whose email domain isn't listed gets the workspace tenant, which has no demo data. |
+| `SHIPCUBE_DATA_ROLLUP_SCHEMA` | `shipcube_rollups` (default) | Where `rollup-build` writes pre-aggregations, if you define any |
 | `META_API_KEY` | optional | `data_propose_migration` drafts with Muse Spark when it is set; with rules otherwise. |
 
 Guardrails take the same variables as in production (`SHIPCUBE_DATA_QUERY_TIMEOUT_S`, `SHIPCUBE_DATA_MAX_ROWS`, …); see [RUNBOOK.md](RUNBOOK.md).
 
-## 3. Wiring the MCP server
+## 3. Wiring
 
-Pin the package to a commit, or to a tag once one is cut:
-
-```toml
-# services/mcp/pyproject.toml
-[project.optional-dependencies]
-data = ["shipcube-data[duckdb,postgres]"]
-
-[tool.uv.sources]
-shipcube-data = { git = "https://github.com/Kunal-Shahi/shipcube-data", rev = "<commit>" }
-```
-
-Build the tools from the environment. The backend no longer needs its own warehouse, migrations or worker thread: `tools_from_env()` opens one catalog and warehouse connection per thread and workspace, lazily.
+ShipCube pins the package by commit in `services/api/pyproject.toml` and `services/mcp/pyproject.toml` (the `data` extra), and `uv sync --locked --extra data` installs it from this public repo. The API builds the tools once, so every call runs in the request's own transaction, under the caller's row-level security (`services/api/shipcube_api/data_layer.py`):
 
 ```python
 from shipcube_data.local import tools_from_env
 
-tools = tools_from_env()                     # reads SHIPCUBE_DATA_CATALOG_URL etc.
+tools = tools_from_env(catalog_session=lambda caller: db.tx(caller))   # the API's RLS-scoped transaction
 tools.specs()                                # the five data_ tools; apply is never among them
 tools.call("data_query", args, caller)       # caller: shipcube_data.Caller from the verified token
 ```
 
-The propose scope is now `data:migrate`, security's name. `data:write` is still accepted, so the server's current scope translation keeps working; it can be removed.
+`data_query` takes a typed query, a staged (L2) query, or governed `sql`; see [QUERY.md](QUERY.md). Without `catalog_session`, `tools_from_env()` opens the catalog from `SHIPCUBE_DATA_CATALOG_URL` instead, as in section 5.
 
 ## 4. Smoke
 
@@ -109,15 +106,24 @@ docker compose run --rm -e SHIPCUBE_MCP_URL=http://mcp:8080/mcp -e SHIPCUBE_PAT 
 
 A caller whose Google domain or email isn't mapped to a demo tenant falls back to the workspace's own tenant, which has no demo data. `data_query` and `data_search_values` then return `tenant_not_provisioned`, with a hint. Map the domain in `SHIPCUBE_DATA_DEMO_TENANTS`, for example `shipcube.local=acme` for the stack's seeded user. Any unexpected exception becomes `internal_error`, with an incident id in the hint and the details in the logs; MCP clients never see raw driver errors.
 
-## 5. Without Docker
+## 5. Without Docker (no cloud account needed)
+
+This is the quickest way to see the agent tools work on the demo data. You need Python 3.12 and [uv](https://docs.astral.sh/uv/); nothing private, no Docker, no GCP:
 
 ```bash
-export SHIPCUBE_DEV_MODE=1 SHIPCUBE_DATA_CATALOG_URL=postgresql://postgres@localhost:5432/shipcube_data \
-       SHIPCUBE_DATA_WORKSPACE=0e364bd8-4622-42d1-839c-35aae720b52b SHIPCUBE_DATA_DUCKDB_PATH=.local/olist.duckdb
+uv venv -p 3.12 .venv && uv pip install -p .venv "shipcube-data[duckdb] @ git+https://github.com/Kunal-Shahi/shipcube-data"
 ```
 
 ```bash
-shipcube-data seed && shipcube-data smoke
+export SHIPCUBE_DEV_MODE=1 SHIPCUBE_DATA_CATALOG_URL=catalog.db \
+       SHIPCUBE_DATA_WORKSPACE=00000000-0000-0000-0000-000000000001 SHIPCUBE_DATA_DUCKDB_PATH=olist.duckdb
 ```
 
-For a Postgres warehouse, also set `SHIPCUBE_DATA_WAREHOUSE=postgres`, `SHIPCUBE_DATA_WAREHOUSE_URL=postgresql://postgres@localhost:5432/warehouse?sslmode=disable` and `SHIPCUBE_DATA_ALLOWED_DB_HOSTS=localhost`.
+```bash
+.venv/bin/shipcube-data seed && .venv/bin/shipcube-data smoke      # smoke: 7/7 passed
+```
+
+The catalog is a SQLite file and the warehouse a DuckDB file. For a Postgres catalog, set `SHIPCUBE_DATA_CATALOG_URL=postgresql://…`. For a Postgres warehouse, also set:
+- `SHIPCUBE_DATA_WAREHOUSE=postgres`;
+- `SHIPCUBE_DATA_WAREHOUSE_URL=postgresql://postgres@localhost:5432/warehouse?sslmode=disable`;
+- `SHIPCUBE_DATA_ALLOWED_DB_HOSTS=localhost`.
